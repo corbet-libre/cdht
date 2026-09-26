@@ -1,0 +1,43 @@
+[package]
+name = "cdht"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Signed replicated records with Veilid DHT semantics, and the sync rules for a member's own devices"
+license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
+repository = "https://github.com/corbet-foss/cdht"
+readme = "README.md"
+publish = false
+include = [
+    "Cargo.toml",
+    "src/**",
+    "tests/**",
+    "README.md",
+    "LICENSE",
+    "LICENSE.md",
+    "LICENSES/*.txt",
+]
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+blake3 = "1.8"
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
+getrandom = "0.4"
+zeroize = "1.8"
+data-encoding = "2.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+# Test double for the signer/verifier ports with VLD0 semantics.
+ed25519-dalek = { version = "3.0.0", features = ["digest"] }
+futures-executor = "0.3"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

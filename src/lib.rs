@@ -1,0 +1,60 @@
+//! `cdht`: signed replicated records with Veilid DHT semantics.
+//!
+//! - A record's **owner** signs its **schema**; the schema lists **writers** with their own
+//!   **subkey** slots ([`Schema`], Veilid's SMPL schema, byte-identical). The record key is
+//!   derived from owner and schema exactly as Veilid derives it.
+//! - Every subkey value carries a **sequence number** and its writer's **signature**, and is
+//!   checked against the owner-signed writer set on every hop ([`SignedValue`]).
+//!   Authorisation is part of the data structure.
+//! - [`Dht`]: open / get / set / **watch**, an **offline write queue**, optional
+//!   per-record **encryption**, and **epochs** (a new writer set is a new record linked
+//!   from the old one) for device removal.
+//! - Fillings behind the [`Backend`] port: [`LocalBackend`] (in memory, complete);
+//!   client DHT over Tor and the Veilid DHT plug in later through `cmsh`'s DHT capability.
+//! - [`sync`]: the rules for the member's private state on top — per-device logs, hybrid
+//!   logical clock, monotonic tombstones, keep-both on concurrent edits.
+//!
+//! `cdht` holds no secret keys (signing goes through the [`Signer`] port), contains no
+//! network code and no policy: `cvlt` decides which records exist and who writes them.
+
+mod backend;
+mod client;
+pub mod crypto;
+mod error;
+mod record;
+mod schema;
+pub mod sync;
+
+pub use backend::{Backend, Change, LocalBackend, SetOutcome, WatchId};
+pub use client::{
+    ClientState, Dht, FlushReport, HEADER_SUBKEY, Header, MAX_EPOCH_HOPS, QueuedWrite, WriteOutcome,
+};
+pub use crypto::{EncryptionKey, Signer, Verifier};
+pub use error::Error;
+pub use record::{Descriptor, MAX_SEQ, RecordKey, SignedValue};
+pub use schema::{
+    MAX_RECORD_DATA_SIZE, MAX_SUBKEY_COUNT, MAX_SUBKEY_SIZE, MAX_WRITER_COUNT, Member, Schema,
+};
+
+/// Serde helper: bytes as base64url without padding.
+pub(crate) mod b64 {
+    use data_encoding::BASE64URL_NOPAD;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub(crate) fn serialize<S: Serializer, T: AsRef<[u8]>>(
+        value: &T,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&BASE64URL_NOPAD.encode(value.as_ref()))
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>, T: TryFrom<Vec<u8>>>(
+        deserializer: D,
+    ) -> Result<T, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let bytes = BASE64URL_NOPAD
+            .decode(text.as_bytes())
+            .map_err(D::Error::custom)?;
+        T::try_from(bytes).map_err(|_| D::Error::custom("wrong length"))
+    }
+}
