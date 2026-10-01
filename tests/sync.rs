@@ -14,7 +14,8 @@ fn put(value: &[u8]) -> Op {
     }
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn clock_is_monotonic_even_when_wall_time_goes_back() {
     let mut clock = Clock::new(60_000);
     let t1 = clock.tick(1_000).unwrap();
@@ -38,7 +39,8 @@ fn clock_is_monotonic_even_when_wall_time_goes_back() {
     );
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn clock_orders_after_observed_remote_times_and_rejects_drift() {
     let mut clock = Clock::new(1_000);
     clock.tick(10_000).unwrap();
@@ -64,7 +66,8 @@ fn clock_orders_after_observed_remote_times_and_rejects_drift() {
     assert_eq!(resumed.last(), clock.last());
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn edits_on_one_device_replace_each_other() {
     let mut clock = Clock::new(60_000);
     let mut log = DeviceLog::new(A);
@@ -80,7 +83,8 @@ fn edits_on_one_device_replace_each_other() {
     }
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn concurrent_edits_keep_both_until_the_member_chooses() {
     let mut clock_a = Clock::new(60_000);
     let mut clock_b = Clock::new(60_000);
@@ -116,7 +120,8 @@ fn concurrent_edits_keep_both_until_the_member_chooses() {
     }
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn tombstones_are_monotonic() {
     let mut clock_a = Clock::new(60_000);
     let mut clock_b = Clock::new(60_000);
@@ -144,7 +149,8 @@ fn tombstones_are_monotonic() {
     ));
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn logs_are_validated() {
     let mut clock = Clock::new(60_000);
     let mut log = DeviceLog::new(A);
@@ -171,7 +177,8 @@ fn logs_are_validated() {
     );
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn compaction_keeps_the_merged_state() {
     let mut clock_a = Clock::new(60_000);
     let mut clock_b = Clock::new(60_000);
@@ -203,7 +210,8 @@ fn compaction_keeps_the_merged_state() {
     assert_eq!(merge(&[compacted, log_b]).unwrap(), before);
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn logs_split_into_subkey_segments() {
     let mut clock = Clock::new(60_000);
     let mut log = DeviceLog::new(A);

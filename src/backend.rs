@@ -1,22 +1,5 @@
-//! The backend port and its local filling.
-//!
-//! A backend stores descriptors and subkey values and notifies watchers. Fillings:
-//!
-//! - [`LocalBackend`] (here): in memory, for tests and debugging. It behaves like a DHT
-//!   node: it validates every write against the owner-signed schema and the writer's
-//!   signature, keeps the highest sequence number, and reports changes to watchers.
-//!   Clones share one store, so several clients can act as the devices of one member.
-//! - **Client DHT over Tor** (TODO, plugs into `cmsh`'s DHT capability): the community's
-//!   member clients store encrypted records for each other, reachable via their onion
-//!   services; the operator stores nothing.
-//! - **Veilid DHT** (TODO, plugs into `cmsh`'s DHT capability, which reaches the one
-//!   `veilid-core` in `cvln`): `create` maps to `create_dht_record` with an SMPL schema and
-//!   the delegated owner key, `set` to `set_dht_value` with the delegated writer key,
-//!   `watch` to `watch_dht_values`.
-//!
-//! `cdht` never reaches a network itself (no layer skipping): remote fillings are
-//! `Backend` implementations provided through `cmsh`. The client ([`crate::Dht`])
-//! validates everything a backend returns, so a remote filling needs no trust.
+//! Validating node storage and the backend port. There is no record expiry.
+//! Remote transports are supplied by Mesh; this module opens no sockets.
 
 use crate::crypto::Verifier;
 use crate::{Descriptor, Error, RecordKey, SignedValue};
@@ -71,6 +54,16 @@ pub trait Backend {
         subkey: u32,
         value: &SignedValue,
     ) -> impl Future<Output = Result<SetOutcome, Error>>;
+    /// Check and repair replication of an existing signed value on open.
+    /// Backends may inspect agreement first; the default republishes unchanged bytes.
+    fn rehydrate(
+        &self,
+        key: &RecordKey,
+        subkey: u32,
+        value: &SignedValue,
+    ) -> impl Future<Output = Result<SetOutcome, Error>> {
+        self.set(key, subkey, value)
+    }
     /// Start watching a record for changes.
     fn watch(&self, key: &RecordKey) -> impl Future<Output = Result<WatchId, Error>>;
     /// Stop a watch.
@@ -83,11 +76,14 @@ struct StoredRecord {
     descriptor: Descriptor,
     schema: crate::Schema,
     values: BTreeMap<u32, SignedValue>,
+    touched: u64,
 }
 
 struct Watch {
     key: RecordKey,
-    changes: Vec<Change>,
+    changes: BTreeMap<u32, Change>,
+    expires: u64,
+    remaining: u32,
 }
 
 struct LocalState {
@@ -95,6 +91,82 @@ struct LocalState {
     records: BTreeMap<RecordKey, StoredRecord>,
     watches: BTreeMap<WatchId, Watch>,
     next_watch: u64,
+    capacity: Capacity,
+    clock: u64,
+    access: u64,
+    evictions: usize,
+}
+
+/// Veilid's remote record capacity defaults. Limits apply to others' records.
+#[derive(Clone, Copy, Debug)]
+pub struct Capacity {
+    /// Maximum remote records.
+    pub records: usize,
+    /// Maximum stored logical bytes (descriptor, signatures, metadata and payload).
+    pub bytes: usize,
+}
+
+impl Capacity {
+    /// Native defaults from veilid_config.rs at dd8e2cdd.
+    pub const NATIVE: Self = Self {
+        records: 128,
+        bytes: 256 * 1024 * 1024,
+    };
+    /// Browser defaults from the same source.
+    pub const BROWSER: Self = Self {
+        records: 64,
+        bytes: 128 * 1024 * 1024,
+    };
+}
+
+/// Maximum watch duration (ten minutes); records themselves never expire.
+pub const MAX_WATCH_MS: u64 = 600_000;
+/// Maximum public subscriptions to a record on one node.
+pub const PUBLIC_WATCH_LIMIT: usize = 32;
+
+impl StoredRecord {
+    fn bytes(&self) -> usize {
+        self.descriptor.schema.len()
+            + 96
+            + self
+                .values
+                .values()
+                .map(|v| v.data.len() + 32 + 64 + 4 + v.nonce.map_or(0, |_| 24))
+                .sum::<usize>()
+    }
+}
+
+impl LocalState {
+    fn touch(&mut self, key: &RecordKey) {
+        self.access = self.access.saturating_add(1);
+        if let Some(record) = self.records.get_mut(key) {
+            record.touched = self.access;
+        }
+    }
+
+    fn enforce_capacity(&mut self, protected: &RecordKey) {
+        while self.records.len() > self.capacity.records
+            || self
+                .records
+                .values()
+                .map(StoredRecord::bytes)
+                .sum::<usize>()
+                > self.capacity.bytes
+        {
+            let oldest = self
+                .records
+                .iter()
+                .filter(|(key, _)| *key != protected)
+                .min_by_key(|(_, record)| record.touched)
+                .map(|(key, _)| *key);
+            let Some(oldest) = oldest else {
+                break;
+            };
+            self.records.remove(&oldest);
+            self.watches.retain(|_, w| w.key != oldest);
+            self.evictions += 1;
+        }
+    }
 }
 
 /// The in-memory filling. Clone it to give several clients the same "network".
@@ -115,13 +187,27 @@ impl<V: Verifier> Clone for LocalBackend<V> {
 impl<V: Verifier> LocalBackend<V> {
     /// An empty, online store that validates writes with `verifier`.
     pub fn new(verifier: V) -> Self {
+        let capacity = if cfg!(all(target_arch = "wasm32", target_os = "unknown")) {
+            Capacity::BROWSER
+        } else {
+            Capacity::NATIVE
+        };
+        Self::with_capacity(verifier, capacity)
+    }
+
+    /// A node store with explicit capacity (use BROWSER for browser nodes).
+    pub fn with_capacity(verifier: V, capacity: Capacity) -> Self {
         Self {
             verifier: Arc::new(verifier),
             state: Arc::new(Mutex::new(LocalState {
                 online: true,
                 records: BTreeMap::new(),
                 watches: BTreeMap::new(),
-                next_watch: 0,
+                next_watch: 1,
+                capacity,
+                clock: 0,
+                access: 0,
+                evictions: 0,
             })),
         }
     }
@@ -130,6 +216,72 @@ impl<V: Verifier> LocalBackend<V> {
     /// [`Error::Unavailable`].
     pub fn set_online(&self, online: bool) {
         self.lock_any().online = online;
+    }
+
+    /// Advance the node's monotonic clock. The network runtime calls this before
+    /// requests and during maintenance. Only watch leases expire, never records.
+    pub fn advance_to(&self, now_ms: u64) {
+        let mut state = self.lock_any();
+        state.clock = state.clock.max(now_ms);
+        let clock = state.clock;
+        state.watches.retain(|_, w| w.expires > clock);
+    }
+
+    /// Stored records, stored bytes, and cumulative LRU evictions.
+    pub fn usage(&self) -> (usize, usize, usize) {
+        let state = self.lock_any();
+        (
+            state.records.len(),
+            state.records.values().map(StoredRecord::bytes).sum(),
+            state.evictions,
+        )
+    }
+
+    /// Create a bounded public watch. Its notifications are hints; clients validate reads.
+    pub fn watch_for(
+        &self,
+        key: &RecordKey,
+        duration_ms: u64,
+        count: u32,
+    ) -> Result<WatchId, Error> {
+        let mut state = self.lock()?;
+        if !state.records.contains_key(key) {
+            return Err(Error::UnknownRecord);
+        }
+        if duration_ms == 0
+            || count == 0
+            || state.watches.values().filter(|w| w.key == *key).count() >= PUBLIC_WATCH_LIMIT
+        {
+            return Err(Error::Unavailable);
+        }
+        let id = WatchId(state.next_watch);
+        state.next_watch = state.next_watch.checked_add(1).ok_or(Error::Unavailable)?;
+        let expires = state.clock.saturating_add(duration_ms.min(MAX_WATCH_MS));
+        state.watches.insert(
+            id,
+            Watch {
+                key: *key,
+                changes: BTreeMap::new(),
+                expires,
+                remaining: count,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Renew an existing public watch within the upstream lease limit.
+    pub fn renew_watch(&self, id: WatchId, duration_ms: u64) -> Result<(), Error> {
+        let mut state = self.lock()?;
+        let expires = state.clock.saturating_add(duration_ms.min(MAX_WATCH_MS));
+        if duration_ms == 0 {
+            return Err(Error::UnknownWatch);
+        }
+        state
+            .watches
+            .get_mut(&id)
+            .ok_or(Error::UnknownWatch)?
+            .expires = expires;
+        Ok(())
     }
 
     fn lock_any(&self) -> std::sync::MutexGuard<'_, LocalState> {
@@ -161,28 +313,39 @@ impl<V: Verifier> Backend for LocalBackend<V> {
                 Err(Error::WrongRecord)
             };
         }
+        if state.capacity.records == 0 || descriptor.schema.len() + 96 > state.capacity.bytes {
+            return Err(Error::Unavailable);
+        }
         state.records.insert(
             key,
             StoredRecord {
                 descriptor: descriptor.clone(),
                 schema,
                 values: BTreeMap::new(),
+                touched: 0,
             },
         );
+        state.touch(&key);
+        state.enforce_capacity(&key);
         Ok(())
     }
 
     async fn descriptor(&self, key: &RecordKey) -> Result<Option<Descriptor>, Error> {
-        Ok(self
-            .lock()?
+        let mut state = self.lock()?;
+        state.touch(key);
+        Ok(state
             .records
             .get(key)
             .map(|record| record.descriptor.clone()))
     }
 
     async fn get(&self, key: &RecordKey, subkey: u32) -> Result<Option<SignedValue>, Error> {
-        let state = self.lock()?;
+        let mut state = self.lock()?;
+        state.touch(key);
         let record = state.records.get(key).ok_or(Error::UnknownRecord)?;
+        if subkey as usize >= record.schema.subkey_count() {
+            return Err(Error::SubkeyOutOfRange);
+        }
         Ok(record.values.get(&subkey).cloned())
     }
 
@@ -193,7 +356,7 @@ impl<V: Verifier> Backend for LocalBackend<V> {
         value: &SignedValue,
     ) -> Result<SetOutcome, Error> {
         let mut state = self.lock()?;
-        let record = state.records.get_mut(key).ok_or(Error::UnknownRecord)?;
+        let record = state.records.get(key).ok_or(Error::UnknownRecord)?;
         value.validate(
             key,
             &record.descriptor.owner,
@@ -201,43 +364,42 @@ impl<V: Verifier> Backend for LocalBackend<V> {
             subkey,
             self.verifier.as_ref(),
         )?;
+        state.touch(key);
+        let byte_limit = state.capacity.bytes;
+        let record = state.records.get_mut(key).ok_or(Error::UnknownRecord)?;
         if let Some(current) = record.values.get(&subkey) {
-            if current == value {
+            if current.same_value(value) {
                 return Ok(SetOutcome::Accepted);
             }
             if current.seq >= value.seq {
                 return Ok(SetOutcome::Newer(current.clone()));
             }
         }
-        record.values.insert(subkey, value.clone());
+        let old = record.values.insert(subkey, value.clone());
+        if record.bytes() > byte_limit {
+            if let Some(old) = old {
+                record.values.insert(subkey, old);
+            } else {
+                record.values.remove(&subkey);
+            }
+            return Err(Error::Unavailable);
+        }
+        state.enforce_capacity(key);
         let change = Change {
             key: *key,
             subkey,
             seq: value.seq,
         };
         for watch in state.watches.values_mut() {
-            if watch.key == *key {
-                watch.changes.push(change);
+            if watch.key == *key && watch.remaining > 0 {
+                watch.changes.insert(subkey, change);
             }
         }
         Ok(SetOutcome::Accepted)
     }
 
     async fn watch(&self, key: &RecordKey) -> Result<WatchId, Error> {
-        let mut state = self.lock()?;
-        if !state.records.contains_key(key) {
-            return Err(Error::UnknownRecord);
-        }
-        let id = WatchId(state.next_watch);
-        state.next_watch += 1;
-        state.watches.insert(
-            id,
-            Watch {
-                key: *key,
-                changes: Vec::new(),
-            },
-        );
-        Ok(id)
+        self.watch_for(key, MAX_WATCH_MS, u32::MAX)
     }
 
     async fn cancel_watch(&self, id: WatchId) -> Result<(), Error> {
@@ -248,6 +410,13 @@ impl<V: Verifier> Backend for LocalBackend<V> {
     async fn changes(&self, id: WatchId) -> Result<Vec<Change>, Error> {
         let mut state = self.lock()?;
         let watch = state.watches.get_mut(&id).ok_or(Error::UnknownWatch)?;
-        Ok(std::mem::take(&mut watch.changes))
+        let changes: Vec<_> = std::mem::take(&mut watch.changes).into_values().collect();
+        if !changes.is_empty() {
+            watch.remaining -= 1;
+        }
+        if watch.remaining == 0 {
+            state.watches.remove(&id);
+        }
+        Ok(changes)
     }
 }

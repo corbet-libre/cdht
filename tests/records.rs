@@ -37,7 +37,8 @@ fn two_device_schema(a: &TestKey, b: &TestKey) -> Schema {
     .unwrap()
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn schema_compiles_to_veilid_smpl_bytes() {
     let a = key(1);
     let schema = Schema::new(
@@ -58,7 +59,8 @@ fn schema_compiles_to_veilid_smpl_bytes() {
     assert_eq!(schema.max_value_len(), cdht::MAX_SUBKEY_SIZE);
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn schema_validation_and_writer_ranges() {
     let (owner, a, b) = (key(1), key(2), key(3));
     assert_eq!(Schema::new(0, vec![]).unwrap_err(), Error::InvalidSchema);
@@ -66,20 +68,14 @@ fn schema_validation_and_writer_ranges() {
         writer: k.public_key(),
         subkeys: n,
     };
-    assert_eq!(
-        Schema::new(1, vec![member(&a, 0)]).unwrap_err(),
-        Error::InvalidSchema
-    );
-    assert_eq!(
-        Schema::new(1, vec![member(&a, 1), member(&a, 1)]).unwrap_err(),
-        Error::InvalidSchema
-    );
+    assert!(Schema::new(1, vec![member(&a, 0)]).is_ok());
+    assert!(Schema::new(1, vec![member(&a, 1), member(&a, 1)]).is_ok());
     assert_eq!(
         Schema::new(1, vec![member(&a, 1024)]).unwrap_err(),
         Error::InvalidSchema
     );
     assert!(Schema::parse(b"SMPL\x01").is_err());
-    assert!(Schema::parse(b"DFLT\x01\x00").is_err());
+    assert!(Schema::parse(b"DFLT\x01\x00").is_ok());
 
     let schema = two_device_schema(&a, &b);
     let o = owner.public_key();
@@ -87,9 +83,9 @@ fn schema_validation_and_writer_ranges() {
     assert_eq!(schema.writer_of(&o, 2), Some(a.public_key()));
     assert_eq!(schema.writer_of(&o, 5), Some(b.public_key()));
     assert_eq!(schema.writer_of(&o, 6), None);
-    assert_eq!(schema.subkeys_of(&o, &a.public_key()), 2..4);
-    assert_eq!(schema.subkeys_of(&o, &o), 0..2);
-    assert_eq!(schema.subkeys_of(&o, &key(9).public_key()), 0..0);
+    assert_eq!(schema.subkeys_of(&o, &a.public_key()), vec![2, 3]);
+    assert_eq!(schema.subkeys_of(&o, &o), vec![0, 1]);
+    assert!(schema.subkeys_of(&o, &key(9).public_key()).is_empty());
     assert_eq!(
         schema.check_write(&o, 2, &b.public_key(), 1).unwrap_err(),
         Error::WrongWriter
@@ -106,7 +102,8 @@ fn schema_validation_and_writer_ranges() {
     );
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn descriptors_and_record_keys_follow_veilid() {
     let (owner, a, b) = (key(1), key(2), key(3));
     let schema = two_device_schema(&a, &b);
@@ -136,7 +133,7 @@ fn descriptors_and_record_keys_follow_veilid() {
         Error::WrongRecord
     );
 
-    // The owner cannot also be a member.
+    // Veilid permits the owner to appear in member slots too.
     let self_member = Schema::new(
         1,
         vec![Member {
@@ -145,10 +142,7 @@ fn descriptors_and_record_keys_follow_veilid() {
         }],
     )
     .unwrap();
-    assert_eq!(
-        Descriptor::create(&self_member, &owner).unwrap_err(),
-        Error::InvalidSchema
-    );
+    assert!(Descriptor::create(&self_member, &owner).is_ok());
 
     let json = serde_json::to_string(&descriptor).unwrap();
     assert_eq!(
@@ -157,14 +151,15 @@ fn descriptors_and_record_keys_follow_veilid() {
     );
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn writes_are_checked_against_the_owner_signed_writer_set() {
     block_on(async {
         let (owner, a, b) = (key(1), key(2), key(3));
         let backend = network();
         let mut dht = client(&backend);
         let record = dht
-            .create(&two_device_schema(&a, &b), &owner, None)
+            .create_epoch(&two_device_schema(&a, &b), &owner, None)
             .await
             .unwrap();
         let header = dht.header(&record, None).await.unwrap();
@@ -193,19 +188,19 @@ fn writes_are_checked_against_the_owner_signed_writer_set() {
         );
 
         // A node never trusts the writer: forged and misplaced values are refused.
-        let forged = SignedValue::sign(&record, 4, 0, b"forged".to_vec(), &a).unwrap();
+        let forged = SignedValue::sign(&owner.public_key(), 4, 0, b"forged".to_vec(), &a).unwrap();
         assert_eq!(
             backend.set(&record, 4, &forged).await.unwrap_err(),
             Error::WrongWriter
         );
-        let mut tampered = SignedValue::sign(&record, 2, 1, b"x".to_vec(), &a).unwrap();
+        let mut tampered = SignedValue::sign(&owner.public_key(), 2, 1, b"x".to_vec(), &a).unwrap();
         tampered.data = b"y".to_vec();
         assert_eq!(
             backend.set(&record, 2, &tampered).await.unwrap_err(),
             Error::BadSignature
         );
         // Replaying an older value returns the newer one.
-        let old = SignedValue::sign(&record, 2, 0, b"older".to_vec(), &a).unwrap();
+        let old = SignedValue::sign(&owner.public_key(), 2, 0, b"older".to_vec(), &a).unwrap();
         match backend.set(&record, 2, &old).await.unwrap() {
             SetOutcome::Newer(current) => assert_eq!(current.data, b"from a"),
             SetOutcome::Accepted => panic!("stale write accepted"),
@@ -213,14 +208,15 @@ fn writes_are_checked_against_the_owner_signed_writer_set() {
     });
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn sequence_numbers_and_stale_writes() {
     block_on(async {
         let (owner, a, b) = (key(1), key(2), key(3));
         let backend = network();
         let mut first = client(&backend);
         let record = first
-            .create(&two_device_schema(&a, &b), &owner, None)
+            .create_epoch(&two_device_schema(&a, &b), &owner, None)
             .await
             .unwrap();
         assert_eq!(
@@ -259,14 +255,15 @@ fn sequence_numbers_and_stale_writes() {
     });
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn offline_writes_are_queued_and_flushed() {
     block_on(async {
         let (owner, a, b) = (key(1), key(2), key(3));
         let backend = network();
         let mut device_a = client(&backend);
         let record = device_a
-            .create(&two_device_schema(&a, &b), &owner, None)
+            .create_epoch(&two_device_schema(&a, &b), &owner, None)
             .await
             .unwrap();
 
@@ -322,14 +319,15 @@ fn offline_writes_are_queued_and_flushed() {
     });
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn flush_reports_stale_queued_writes() {
     block_on(async {
         let (owner, a, b) = (key(1), key(2), key(3));
         let backend = network();
         let mut offline = client(&backend);
         let record = offline
-            .create(&two_device_schema(&a, &b), &owner, None)
+            .create_epoch(&two_device_schema(&a, &b), &owner, None)
             .await
             .unwrap();
         let mut online = client(&backend);
@@ -376,14 +374,15 @@ fn flush_reports_stale_queued_writes() {
     });
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn watchers_see_changes() {
     block_on(async {
         let (owner, a, b) = (key(1), key(2), key(3));
         let backend = network();
         let mut writer = client(&backend);
         let record = writer
-            .create(&two_device_schema(&a, &b), &owner, None)
+            .create_epoch(&two_device_schema(&a, &b), &owner, None)
             .await
             .unwrap();
         let mut watcher = client(&backend);
@@ -406,7 +405,8 @@ fn watchers_see_changes() {
     });
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn encrypted_records_hide_data_from_the_backend() {
     block_on(async {
         let (owner, a, b) = (key(1), key(2), key(3));
@@ -414,7 +414,7 @@ fn encrypted_records_hide_data_from_the_backend() {
         let backend = network();
         let mut dht = client(&backend);
         let record = dht
-            .create(&two_device_schema(&a, &b), &owner, Some(&secret))
+            .create_epoch(&two_device_schema(&a, &b), &owner, Some(&secret))
             .await
             .unwrap();
         dht.set(&record, 2, b"private note", &a, Some(&secret))
@@ -432,20 +432,23 @@ fn encrypted_records_hide_data_from_the_backend() {
             b"private note"
         );
         let wrong = EncryptionKey::from_bytes([7; 32]);
-        assert_eq!(
-            dht.get(&record, 2, Some(&wrong)).await.unwrap_err(),
-            Error::Decrypt
+        // Veilid's record cipher has no key confirmation: a wrong key yields garbage.
+        assert_ne!(
+            dht.get(&record, 2, Some(&wrong))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"private note"
         );
         // The header is encrypted too.
-        assert_eq!(
-            dht.header(&record, None).await.unwrap_err(),
-            Error::Encoding
-        );
+        assert_eq!(dht.header(&record, None).await.unwrap_err(), Error::Decrypt);
         assert_eq!(dht.header(&record, Some(&secret)).await.unwrap().epoch, 0);
     });
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn epochs_link_records_and_exclude_removed_writers() {
     block_on(async {
         let (owner, a, b) = (key(1), key(2), key(3));
@@ -455,7 +458,7 @@ fn epochs_link_records_and_exclude_removed_writers() {
         let backend = network();
         let mut dht = client(&backend);
         let old = dht
-            .create(&two_device_schema(&a, &b), &owner, Some(&old_secret))
+            .create_epoch(&two_device_schema(&a, &b), &owner, Some(&old_secret))
             .await
             .unwrap();
 
@@ -535,14 +538,15 @@ fn epochs_link_records_and_exclude_removed_writers() {
     });
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn client_state_persists_and_is_revalidated() {
     block_on(async {
         let (owner, a, b) = (key(1), key(2), key(3));
         let backend = network();
         let mut dht = client(&backend);
         let record = dht
-            .create(&two_device_schema(&a, &b), &owner, None)
+            .create_epoch(&two_device_schema(&a, &b), &owner, None)
             .await
             .unwrap();
         dht.set(&record, 2, b"kept", &a, None).await.unwrap();
@@ -574,6 +578,117 @@ fn client_state_persists_and_is_revalidated() {
         assert_ne!(tampered, json);
         let state: ClientState = serde_json::from_str(&tampered).unwrap();
         let mut resumed = Dht::with_state(backend.clone(), TestVerifier, state);
-        assert!(resumed.get(&record, 2, None).await.unwrap().is_none());
+        assert_eq!(
+            resumed.get(&record, 2, None).await.unwrap_err(),
+            Error::Unavailable
+        );
+    });
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn scoped_signer_can_end_before_any_network_io() {
+    block_on(async {
+        let backend = LocalBackend::new(TestVerifier);
+        backend.set_online(false);
+        let mut writer = Dht::new(backend.clone(), TestVerifier);
+        let encryption = EncryptionKey::from_bytes([19; 32]);
+        let record = {
+            let owner = key(71);
+            let record = writer
+                .queue_create(&Schema::dflt(1).unwrap(), &owner)
+                .unwrap();
+            assert_eq!(
+                writer
+                    .queue_set(&record, 0, b"scoped data", &owner, Some(&encryption))
+                    .unwrap(),
+                0
+            );
+            record
+        };
+        {
+            let owner = key(71);
+            let before = writer.state().queue()[0].value.raw_blob().unwrap();
+            writer
+                .queue_set(&record, 0, b"scoped data", &owner, Some(&encryption))
+                .unwrap();
+            assert_eq!(writer.state().queue()[0].value.raw_blob().unwrap(), before);
+        }
+        let staged = writer.state().clone();
+        let original = staged.queue()[0].value.raw_blob().unwrap();
+        let signature = staged.queue()[0].value.signature;
+        assert_eq!(writer.flush().await.unwrap().remaining, 1);
+        backend.set_online(true);
+        let mut restored = Dht::with_state(backend.clone(), TestVerifier, staged);
+        assert_eq!(restored.flush().await.unwrap().written, 1);
+        let stored = backend.get(&record, 0).await.unwrap().unwrap();
+        assert_eq!(stored.raw_blob().unwrap(), original);
+        assert_eq!(stored.signature, signature);
+        assert_eq!(
+            restored
+                .get(&record, 0, Some(&encryption))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"scoped data"
+        );
+    });
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn scoped_cipher_opens_only_authenticated_values() {
+    block_on(async {
+        let backend = network();
+        let mut writer = client(&backend);
+        let owner = key(72);
+        let encryption = EncryptionKey::from_bytes([23; 32]);
+        let record = writer
+            .queue_create(&Schema::dflt(1).unwrap(), &owner)
+            .unwrap();
+        {
+            let crypt = |nonce: &[u8; 24], bytes: &[u8]| encryption.crypt(nonce, bytes);
+            writer
+                .queue_set(&record, 0, b"original", &owner, Some(&crypt))
+                .unwrap();
+        }
+        assert_eq!(writer.flush().await.unwrap().written, 1);
+        let mut reader = client(&backend);
+        reader.open(&record).await.unwrap();
+        let value = reader.get_signed(&record, 0).await.unwrap().unwrap();
+        let calls = std::cell::Cell::new(0);
+        let crypt = |nonce: &[u8; 24], bytes: &[u8]| {
+            calls.set(calls.get() + 1);
+            encryption.crypt(nonce, bytes)
+        };
+        assert_eq!(
+            reader
+                .open_value(&record, 0, &value, Some(&crypt))
+                .unwrap()
+                .as_slice(),
+            b"original"
+        );
+        assert_eq!(calls.get(), 1);
+        let mut invalid = value.clone();
+        invalid.signature[0] ^= 1;
+        assert_eq!(
+            reader.open_value(&record, 0, &invalid, Some(&crypt)),
+            Err(Error::BadSignature)
+        );
+        let mut invalid_nonce = value.clone();
+        invalid_nonce.nonce.as_mut().unwrap()[0] ^= 1;
+        assert!(
+            reader
+                .open_value(&record, 0, &invalid_nonce, Some(&crypt))
+                .is_err()
+        );
+        assert!(reader.open_value(&record, 1, &value, Some(&crypt)).is_err());
+        assert_eq!(calls.get(), 1);
+        let refused = |_nonce: &[u8; 24], _bytes: &[u8]| Err(Error::Crypto);
+        assert_eq!(
+            reader.open_value(&record, 0, &value, Some(&refused)),
+            Err(Error::Crypto)
+        );
     });
 }

@@ -1,17 +1,16 @@
-//! Signed records: descriptor, record key, subkey values.
-//!
-//! Semantics follow Veilid's DHT records: the owner signs the compiled schema (the
-//! descriptor); the record key is BLAKE3(`VLD0` ‖ owner ‖ schema), exactly as Veilid
-//! derives its opaque record key; each subkey holds a value with a sequence number,
-//! signed by its writer. A higher sequence number replaces a lower one.
-//!
-//! The value signature covers our own byte layout ([`SignedValue::signed_bytes`]), not
-//! Veilid's Cap'n Proto blob: the Veilid filling writes through `veilid-core`, which signs
-//! with the delegated writer key itself. Keys, schema, subkeys and sequence numbers are
-//! identical, so moving a record between fillings needs no data migration.
+// SPDX-License-Identifier: MPL-2.0
+// Portions of Veilid, Copyright Veilid contributors.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// Upstream: veilid/veilid, dd8e2cdd72b5bf817172ac31c20872b168c5c8fc.
+//! Veilid record keys, signed descriptors and values.
+//! Ports of veilid-core/src/veilid_api/types/dht/derivation.rs and
+//! storage_manager/types/{signed_value_descriptor,signed_value_data,encrypted_value_data}.rs.
 
 use crate::crypto::{CRYPTO_KIND_VLD0, PublicKey, Signature, Signer, Verifier};
 use crate::{Error, Schema, b64};
+use capnp::message::ReaderSegments;
 use data_encoding::BASE64URL_NOPAD;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -97,15 +96,7 @@ impl Descriptor {
             signature: owner.sign(&compiled)?,
             schema: compiled,
         };
-        descriptor.check_members(schema)?;
         Ok(descriptor)
-    }
-
-    fn check_members(&self, schema: &Schema) -> Result<(), Error> {
-        if schema.members().iter().any(|m| m.writer == self.owner) {
-            return Err(Error::InvalidSchema);
-        }
-        Ok(())
     }
 
     /// The record key this descriptor defines.
@@ -115,11 +106,10 @@ impl Descriptor {
 
     /// Verify the owner's signature and parse the schema.
     pub fn validate(&self, verifier: &impl Verifier) -> Result<Schema, Error> {
+        let schema = Schema::parse(&self.schema)?;
         if !verifier.verify(&self.owner, &self.schema, &self.signature) {
             return Err(Error::BadSignature);
         }
-        let schema = Schema::parse(&self.schema)?;
-        self.check_members(&schema)?;
         Ok(schema)
     }
 
@@ -141,6 +131,11 @@ pub struct SignedValue {
     /// The data (ciphertext for encrypted records).
     #[serde(with = "b64")]
     pub data: Vec<u8>,
+    /// Separate VLD0 nonce. Presence selects the encrypted signature format.
+    pub nonce: Option<[u8; 24]>,
+    /// Original upstream blob, preserved for forwarding non-canonical input bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blob: Option<Vec<u8>>,
     /// The writer's public key.
     #[serde(with = "b64")]
     pub writer: PublicKey,
@@ -150,47 +145,183 @@ pub struct SignedValue {
 }
 
 impl SignedValue {
-    /// The exact bytes a writer signs: domain, record, subkey, sequence, writer, data.
-    pub fn signed_bytes(
-        key: &RecordKey,
-        subkey: u32,
-        seq: u32,
-        writer: &PublicKey,
-        data: &[u8],
-    ) -> Vec<u8> {
-        let mut out = Vec::with_capacity(16 + 32 + 4 + 4 + 32 + 4 + data.len());
-        out.extend_from_slice(b"cdht.value.v1\0");
-        out.extend_from_slice(&key.0);
-        out.extend_from_slice(&subkey.to_le_bytes());
-        out.extend_from_slice(&seq.to_le_bytes());
-        out.extend_from_slice(writer);
-        out.extend_from_slice(&u32::try_from(data.len()).unwrap_or(u32::MAX).to_le_bytes());
-        out.extend_from_slice(data);
-        out
+    /// Unpacked Veilid ValueData message, including its segment table.
+    pub fn raw_blob(&self) -> Result<Vec<u8>, Error> {
+        if let Some(blob) = &self.blob {
+            let decoded = Self::from_blob(blob.clone(), self.signature)?;
+            if !self.same_fields(&decoded) {
+                return Err(Error::Encoding);
+            }
+            return Ok(blob.clone());
+        }
+        if self.seq > MAX_SEQ {
+            return Err(Error::SeqExhausted);
+        }
+        if self.data.len() > crate::MAX_SUBKEY_SIZE {
+            return Err(Error::ValueTooLarge);
+        }
+        let mut message = capnp::message::Builder::new_default();
+        let mut builder = message.init_root::<crate::veilid_capnp::value_data::Builder>();
+        builder.set_seq(self.seq);
+        builder.set_data(&self.data);
+        let mut writer = builder.reborrow().init_writer();
+        writer.set_kind(u32::from_be_bytes(CRYPTO_KIND_VLD0));
+        writer.set_value(&self.writer);
+        if let Some(nonce) = self.nonce {
+            builder.reborrow().init_nonce().set_value(&nonce);
+        }
+        // Match Veilid's helper exactly: only multi-segment builders are canonicalized.
+        if message.len() != 1 {
+            let root = message
+                .get_root_as_reader::<capnp::any_pointer::Reader>()
+                .map_err(|_| Error::Encoding)?;
+            let size = root.target_size().map_err(|_| Error::Encoding)?.word_count + 1;
+            let mut canonical = capnp::message::Builder::new(
+                capnp::message::HeapAllocator::new().first_segment_words(size as u32),
+            );
+            canonical
+                .set_root_canonical(root)
+                .map_err(|_| Error::Encoding)?;
+            Ok(capnp::serialize::write_message_to_words(&canonical))
+        } else {
+            Ok(capnp::serialize::write_message_to_words(&message))
+        }
     }
 
-    /// Sign `data` for `subkey` of `key` at `seq`.
+    /// Decode an upstream blob without rewriting the bytes its signature covers.
+    /// This checks shape and limits; call `validate` before accepting the value.
+    pub fn from_blob(blob: Vec<u8>, signature: Signature) -> Result<Self, Error> {
+        if blob.len() > crate::MAX_SUBKEY_SIZE + 1024 {
+            return Err(Error::ValueTooLarge);
+        }
+        let mut slice = blob.as_slice();
+        let mut options = capnp::message::ReaderOptions::new();
+        options.traversal_limit_in_words(Some(8192));
+        options.nesting_limit(8);
+        let message = capnp::serialize::read_message_from_flat_slice(&mut slice, options)
+            .map_err(|_| Error::Encoding)?;
+        if !slice.is_empty() {
+            return Err(Error::Encoding);
+        }
+        let reader = message
+            .get_root::<crate::veilid_capnp::value_data::Reader>()
+            .map_err(|_| Error::Encoding)?;
+        let seq = reader.get_seq();
+        if seq > MAX_SEQ {
+            return Err(Error::SeqExhausted);
+        }
+        let data = reader.get_data().map_err(|_| Error::Encoding)?;
+        if data.len() > crate::MAX_SUBKEY_SIZE {
+            return Err(Error::ValueTooLarge);
+        }
+        let writer = reader.get_writer().map_err(|_| Error::Encoding)?;
+        if writer.get_kind() != u32::from_be_bytes(CRYPTO_KIND_VLD0) {
+            return Err(Error::Encoding);
+        }
+        let writer = writer
+            .get_value()
+            .map_err(|_| Error::Encoding)?
+            .try_into()
+            .map_err(|_| Error::Encoding)?;
+        let nonce = if reader.has_nonce() {
+            Some(
+                reader
+                    .get_nonce()
+                    .map_err(|_| Error::Encoding)?
+                    .get_value()
+                    .map_err(|_| Error::Encoding)?
+                    .try_into()
+                    .map_err(|_| Error::Encoding)?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            seq,
+            data: data.to_vec(),
+            writer,
+            nonce,
+            signature,
+            blob: Some(blob),
+        })
+    }
+
+    /// Compare Veilid value data, ignoring the signature and serialization bookkeeping.
+    pub fn same_value(&self, other: &Self) -> bool {
+        self.same_fields(other)
+            && self
+                .raw_blob()
+                .ok()
+                .zip(other.raw_blob().ok())
+                .is_some_and(|(a, b)| a == b)
+    }
+
+    fn same_fields(&self, other: &Self) -> bool {
+        self.seq == other.seq
+            && self.data == other.data
+            && self.writer == other.writer
+            && self.nonce == other.nonce
+    }
+
+    /// Exact upstream signature input. Unencrypted values retain the legacy encoding.
+    pub fn signed_bytes(&self, owner: &PublicKey, subkey: u32) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::new();
+        if self.nonce.is_some() {
+            let blob = self.raw_blob()?;
+            out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+            out.extend_from_slice(&blob);
+            out.extend_from_slice(&CRYPTO_KIND_VLD0);
+            out.extend_from_slice(&32u32.to_le_bytes());
+            out.extend_from_slice(owner);
+            out.extend_from_slice(&subkey.to_le_bytes());
+        } else {
+            out.extend_from_slice(owner);
+            out.extend_from_slice(&subkey.to_le_bytes());
+            out.extend_from_slice(&self.seq.to_le_bytes());
+            out.extend_from_slice(&self.data);
+        }
+        Ok(out)
+    }
+
+    /// Sign an unencrypted value using Veilid's owner-bound legacy encoding.
     pub fn sign(
-        key: &RecordKey,
+        owner: &PublicKey,
         subkey: u32,
         seq: u32,
         data: Vec<u8>,
         writer: &impl Signer,
     ) -> Result<Self, Error> {
+        Self::sign_with_nonce(owner, subkey, seq, data, None, writer)
+    }
+
+    /// Sign ciphertext and a separate nonce, or a legacy plaintext value.
+    pub fn sign_with_nonce(
+        owner: &PublicKey,
+        subkey: u32,
+        seq: u32,
+        data: Vec<u8>,
+        nonce: Option<[u8; 24]>,
+        writer: &impl Signer,
+    ) -> Result<Self, Error> {
         if seq > MAX_SEQ {
             return Err(Error::SeqExhausted);
         }
-        let public = writer.public_key();
-        let signature = writer.sign(&Self::signed_bytes(key, subkey, seq, &public, &data))?;
-        Ok(Self {
+        if data.len() > crate::MAX_SUBKEY_SIZE {
+            return Err(Error::ValueTooLarge);
+        }
+        let mut value = Self {
             seq,
             data,
-            writer: public,
-            signature,
-        })
+            nonce,
+            writer: writer.public_key(),
+            signature: [0; 64],
+            blob: None,
+        };
+        value.signature = writer.sign(&value.signed_bytes(owner, subkey)?)?;
+        Ok(value)
     }
 
-    /// Check the value against the record's schema and the writer's signature.
+    /// Validate schema, sequence, raw bytes and signature before use or forwarding.
     pub fn validate(
         &self,
         key: &RecordKey,
@@ -199,12 +330,21 @@ impl SignedValue {
         subkey: u32,
         verifier: &impl Verifier,
     ) -> Result<(), Error> {
+        if RecordKey::derive(owner, &schema.compile()) != *key {
+            return Err(Error::WrongRecord);
+        }
         if self.seq > MAX_SEQ {
             return Err(Error::SeqExhausted);
         }
         schema.check_write(owner, subkey, &self.writer, self.data.len())?;
-        let bytes = Self::signed_bytes(key, subkey, self.seq, &self.writer, &self.data);
-        if !verifier.verify(&self.writer, &bytes, &self.signature) {
+        if self.blob.is_some() {
+            self.raw_blob()?;
+        }
+        if !verifier.verify(
+            &self.writer,
+            &self.signed_bytes(owner, subkey)?,
+            &self.signature,
+        ) {
             return Err(Error::BadSignature);
         }
         Ok(())

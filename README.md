@@ -12,21 +12,23 @@ checked against it wherever it lands.
 
 | Concept | Behaviour | Veilid equivalent |
 |---|---|---|
-| Schema | owner subkeys + writers with their own subkey ranges | SMPL schema, byte-identical compiled form |
+| Schema | DFLT owner slots; SMPL owner and member slot ranges | DFLT and SMPL, byte-identical compiled form |
 | Descriptor | owner signs the compiled schema | `SignedValueDescriptor` |
 | Record key | BLAKE3(`VLD0` ‖ owner ‖ schema), text `VLD0:<base64url>` | opaque record key, identical |
-| Value | sequence number + data + writer + writer signature; higher seq wins | `SignedValueData` (semantics; see below) |
+| Value | sequence number + data + writer + writer signature; higher seq wins | `SignedValueData` (upstream byte oracle in CI) |
 | Limits | 32 KiB per subkey, 1 MiB per record, 1024 subkeys, 256 writers | same constants |
-| Encryption | optional per-record key, XChaCha20-Poly1305 bound to record and subkey | encrypted records |
+| Encryption | optional per-record key, XChaCha20, nonce authenticated by the value signature | encrypted records |
 
-`cdht` is slightly stricter than Veilid: owner subkey 0 always holds the record
-**header** (epoch, predecessor, successor), writers are unique, differ from the owner and
-own at least one subkey.
+DFLT and SMPL match the pinned Veilid schemas, including zero owner slots,
+zero-sized member entries, repeated writers and owner-as-member slots. Ordinary
+`create` leaves every subkey empty. `create_epoch` opts into the application header.
 
-The value signature covers our own byte layout, not Veilid's Cap'n Proto blob. The Veilid
-filling writes through `veilid-core`, which signs with the delegated writer key itself;
-keys, schemas, subkeys and sequence numbers are identical, so switching fillings needs no
-data migration.
+Value signatures use Veilid's legacy owner/subkey/sequence/data input for clear
+records, and its unpacked Cap'n Proto blob input for encrypted records. Record
+encryption is XChaCha20 with a separate signed nonce, without an AEAD tag. Wrong
+read keys produce garbage; application formats must detect unusable plaintext.
+No adapter may re-sign, renumber or re-encrypt a stored value during transport.
+See [CONFORMANCE](docs/CONFORMANCE.md) for the source inventory and deviations.
 
 ## Client
 
@@ -42,17 +44,24 @@ link into its header and the successor link into the old header; `latest` follow
 chain and stops before a successor the reader cannot decrypt — a removed device keeps
 only the old epoch.
 
-## Fillings (`Backend` port)
+## Backends and network port
 
-- `LocalBackend`: in memory, complete; validates like a DHT node; clones share one
-  network; can simulate going offline. For tests and debugging.
-- Client DHT over Tor — **TODO**: provided through `cmsh`'s DHT capability (members'
-  clients store encrypted records for each other; the operator stores nothing).
-- Veilid DHT — **TODO**: provided through `cmsh`'s DHT capability, which reaches the one
-  `veilid-core` in `cvln` (`create_dht_record` with SMPL + delegated owner key,
-  `set_dht_value` with the delegated writer key, `watch_dht_values`).
+`NetworkBackend<N, V>` performs closest-node fanout over `Network`: five write
+acknowledgments, three-copy read agreement, explicit partial read evidence,
+validated conflict responses and owner rehydration of existing signed values.
+`LocalBackend` is one independently bounded node store, with native/browser
+capacity presets, LRU eviction, no record expiry and bounded public watch leases.
 
-`cdht` never reaches a network itself (no layer skipping).
+Mesh supplies actual transport and durable node storage. The current Mesh DHT
+hook loses signatures/nonces and therefore needs revision before it can carry
+these records. [NETWORK-PORT](docs/NETWORK-PORT.md) specifies the integration.
+The future Veilid adapter must import and republish existing signed values;
+calling a signing `set_dht_value` API alone is insufficient.
+
+`cdht` contains no network implementation and never depends on `veilid-core` in
+production. Its dedicated conformance CI job builds the pinned upstream as an
+independent oracle. [CHURN](docs/CHURN.md) describes the simulated population
+measurements; they are not live Tor measurements.
 
 ## Sync rules (`sync`)
 
@@ -76,7 +85,7 @@ keys, no network code, no recovery.
 
 ## Open points / TODO
 
-- Remote fillings (above).
+- Mesh/Tor and Veilid adapter integration (above).
 - Group membership without a server (MLS commit arbitration) is a separate design topic
   (`cgrp`), not part of `cdht`.
 - A removed device still holds the old owner key and could write a competing successor
@@ -91,3 +100,9 @@ Copyright 2026 Julian Y. Richard Corbet. Licensed under
 [LGPL-3.0-only](LICENSES/LGPL-3.0-only.txt)
 [WITH LGPL-3.0-linking-exception](LICENSES/LGPL-3.0-linking-exception.txt).
 See [LICENSE.md](LICENSE.md).
+
+## Continuous verification
+
+Dependency updates follow main and are tested against one CI-resolved lockfile.
+Line and branch coverage target 100%; failures remain blocking. See
+[the coverage contract](docs/COVERAGE.md) for measurement and exclusions.

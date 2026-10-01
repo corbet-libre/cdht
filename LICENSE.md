@@ -16,3 +16,6 @@ conditions. Distribution must preserve the library's notices and the openness
 of library modifications, including reverse engineering to debug such changes.
 The application license must not restrict those library rights. No relinking
 route or object files are required for combined works under the exception.
+
+Veilid-derived files bearing `SPDX-License-Identifier: MPL-2.0` remain under
+[MPL-2.0](LICENSES/MPL-2.0.txt), with their upstream notices and provenance.

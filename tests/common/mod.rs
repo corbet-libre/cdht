@@ -9,7 +9,11 @@ use ed25519_dalek::{Digest, Sha512, SigningKey, VerifyingKey};
 pub struct TestKey(SigningKey);
 
 pub fn key(seed: u8) -> TestKey {
-    TestKey(SigningKey::from_bytes(&[seed; 32]))
+    key_bytes([seed; 32])
+}
+
+pub fn key_bytes(seed: [u8; 32]) -> TestKey {
+    TestKey(SigningKey::from_bytes(&seed))
 }
 
 fn prehash(data: &[u8]) -> Sha512 {

@@ -1,19 +1,20 @@
-//! Crypto ports and record encryption.
-//!
-//! `cdht` signs and verifies through two small ports, so it never holds a secret key and
-//! does not depend on a particular key store: in the vault, `cvlt` adapts `ckmg`'s key
-//! ring (VLD0: Ed25519ph with context `VLD0_SIGN`); tests use a local double. Keys are raw
-//! 32-byte VLD0 public keys, signatures raw 64-byte VLD0 signatures.
-//!
-//! Record data can be encrypted with a per-record key (XChaCha20-Poly1305), as Veilid
-//! does for encrypted DHT records. The key travels with the record key out of band, never
-//! inside the record.
+// SPDX-License-Identifier: MPL-2.0
+// Portions of Veilid, Copyright Veilid contributors.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// Upstream: veilid/veilid, dd8e2cdd72b5bf817172ac31c20872b168c5c8fc.
+//! VLD0 signing ports and record encryption.
+//! Port of veilid-core/src/storage_manager/record_encryption.rs and
+//! crypto/crypto_system/vld0/mod.rs. DHT encryption uses XChaCha20 without an
+//! authentication tag; the record's signature authenticates ciphertext and nonce.
 
-use crate::Error;
-use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit, Payload},
+use crate::{Error, RecordKey};
+use chacha20::{
+    XChaCha20,
+    cipher::{KeyIvInit, StreamCipher},
 };
+use data_encoding::BASE64URL_NOPAD;
 use zeroize::Zeroizing;
 
 /// A raw VLD0 public key (Ed25519).
@@ -39,69 +40,71 @@ pub trait Verifier {
     fn verify(&self, public_key: &PublicKey, data: &[u8], signature: &Signature) -> bool;
 }
 
-const NONCE_LENGTH: usize = 24;
-const AAD_LABEL: &[u8] = b"cdht.value-data.v1\0";
+/// A scoped VLD0 record cipher supplied by the key owner. Implementations must
+/// retain custody of the key; this port exposes only the cipher operation.
+/// Records supplies fresh encryption nonces and verifies signatures before opening.
+pub trait RecordCipher {
+    /// Apply upstream XChaCha20 without an authentication tag. The original record
+    /// signature authenticates the nonce and ciphertext before decryption.
+    fn crypt(&self, nonce: &[u8; 24], input: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error>;
+}
 
-/// A per-record symmetric key. Wiped on drop.
+impl<F> RecordCipher for F
+where
+    F: Fn(&[u8; 24], &[u8]) -> Result<Zeroizing<Vec<u8>>, Error>,
+{
+    fn crypt(&self, nonce: &[u8; 24], input: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+        self(nonce, input)
+    }
+}
+
+/// An independent Veilid read capability for interoperability. Wiped on drop;
+/// never sent to storage nodes. Device production code instead lends a scoped
+/// [`RecordCipher`] from its key owner, without exporting the owner's secret.
 #[derive(Clone)]
 pub struct EncryptionKey(Zeroizing<[u8; 32]>);
 
 impl EncryptionKey {
-    /// Wrap 32 secret bytes (in the vault: a member-scope purpose secret from `ckmg`).
+    /// Wrap a VLD0 shared secret supplied by the key owner.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(Zeroizing::new(bytes))
     }
 
-    fn cipher(&self) -> Result<XChaCha20Poly1305, Error> {
-        XChaCha20Poly1305::new_from_slice(self.0.as_slice()).map_err(|_| Error::Crypto)
-    }
-
-    /// Encrypt one subkey's data, bound to the record and subkey.
-    pub(crate) fn seal(
-        &self,
-        record: &[u8; 32],
-        subkey: u32,
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, Error> {
-        let mut nonce = [0u8; NONCE_LENGTH];
-        getrandom::fill(&mut nonce).map_err(|_| Error::Randomness)?;
-        let ciphertext = self
-            .cipher()?
-            .encrypt(
-                &XNonce::try_from(&nonce[..]).map_err(|_| Error::Crypto)?,
-                Payload {
-                    msg: plaintext,
-                    aad: &aad(record, subkey),
-                },
-            )
+    /// Apply Veilid's symmetric record cipher. The caller must supply a fresh nonce
+    /// for every encryption and verify the signed value before decryption.
+    pub fn crypt(&self, nonce: &[u8; 24], input: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+        let mut out = Zeroizing::new(input.to_vec());
+        XChaCha20::new((&*self.0).into(), nonce.into())
+            .try_apply_keystream(&mut out)
             .map_err(|_| Error::Crypto)?;
-        let mut out = Vec::with_capacity(NONCE_LENGTH + ciphertext.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ciphertext);
         Ok(out)
     }
 
-    /// Decrypt one subkey's data.
-    pub(crate) fn open(
-        &self,
-        record: &[u8; 32],
-        subkey: u32,
-        sealed: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, Error> {
-        if sealed.len() < NONCE_LENGTH {
-            return Err(Error::Decrypt);
+    /// Veilid's full record-key encoding, including the secret read capability.
+    /// Treat the returned string as a secret; never log or send it to DHT nodes.
+    pub fn record_key(&self, opaque: &RecordKey) -> Zeroizing<String> {
+        Zeroizing::new(format!("{}:{}", opaque, BASE64URL_NOPAD.encode(&*self.0)))
+    }
+
+    /// Decode a full VLD0 record key, separating its public locator and read secret.
+    pub fn parse_record_key(text: &str) -> Result<(RecordKey, Option<Self>), Error> {
+        let parts: Vec<_> = text.split(':').collect();
+        match parts.as_slice() {
+            ["VLD0", _] => Ok((text.parse()?, None)),
+            ["VLD0", opaque, secret] => {
+                let bytes = Zeroizing::new(
+                    BASE64URL_NOPAD
+                        .decode(secret.as_bytes())
+                        .map_err(|_| Error::Encoding)?,
+                );
+                let secret: [u8; 32] = bytes.as_slice().try_into().map_err(|_| Error::Encoding)?;
+                Ok((
+                    format!("VLD0:{opaque}").parse()?,
+                    Some(Self::from_bytes(secret)),
+                ))
+            }
+            _ => Err(Error::Encoding),
         }
-        let (nonce, ciphertext) = sealed.split_at(NONCE_LENGTH);
-        self.cipher()?
-            .decrypt(
-                &XNonce::try_from(nonce).map_err(|_| Error::Decrypt)?,
-                Payload {
-                    msg: ciphertext,
-                    aad: &aad(record, subkey),
-                },
-            )
-            .map(Zeroizing::new)
-            .map_err(|_| Error::Decrypt)
     }
 }
 
@@ -111,10 +114,8 @@ impl std::fmt::Debug for EncryptionKey {
     }
 }
 
-fn aad(record: &[u8; 32], subkey: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(AAD_LABEL.len() + 36);
-    out.extend_from_slice(AAD_LABEL);
-    out.extend_from_slice(record);
-    out.extend_from_slice(&subkey.to_le_bytes());
-    out
+impl RecordCipher for EncryptionKey {
+    fn crypt(&self, nonce: &[u8; 24], input: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+        self.crypt(nonce, input)
+    }
 }

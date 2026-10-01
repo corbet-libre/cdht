@@ -1,14 +1,11 @@
-//! Record schemas: who may write which subkey.
-//!
-//! The schema is Veilid's SMPL schema: `o_cnt` owner subkeys, then for each member a
-//! writer key and its number of subkeys, in order. It compiles to the same bytes as
-//! Veilid (`"SMPL" ‖ o_cnt:u16le ‖ (key[32] ‖ count:u16le)*`), so a record has the same
-//! key in every filling. The owner signs the compiled schema; every write is checked
-//! against it — authorisation is part of the data structure.
-//!
-//! `cdht` is slightly stricter than Veilid: the owner has at least one subkey (subkey 0
-//! holds the record header, see [`crate::Header`]), writers are unique, differ from the
-//! owner (checked by [`crate::Descriptor`]) and have at least one subkey each.
+// SPDX-License-Identifier: MPL-2.0
+// Portions of Veilid, Copyright Veilid contributors.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// Upstream: veilid/veilid, dd8e2cdd72b5bf817172ac31c20872b168c5c8fc.
+//! Veilid schema encoding and slot validation.
+//! Port of veilid-core/src/veilid_api/types/dht/{schema/*.rs,derivation.rs}.
 
 use crate::Error;
 use crate::crypto::PublicKey;
@@ -37,9 +34,10 @@ pub struct Member {
     pub subkeys: u16,
 }
 
-/// A validated SMPL schema.
+/// A validated Veilid DFLT or SMPL schema.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Schema {
+    kind: [u8; 4],
     owner_subkeys: u16,
     members: Vec<Member>,
 }
@@ -48,6 +46,7 @@ impl Schema {
     /// A schema with `owner_subkeys` owner subkeys and `members` in order.
     pub fn new(owner_subkeys: u16, members: Vec<Member>) -> Result<Self, Error> {
         let schema = Self {
+            kind: FCC_SMPL,
             owner_subkeys,
             members,
         };
@@ -55,17 +54,26 @@ impl Schema {
         Ok(schema)
     }
 
+    /// Veilid's DFLT schema: owner-only subkeys, with a distinct compiled form.
+    pub fn dflt(owner_subkeys: u16) -> Result<Self, Error> {
+        let mut schema = Self::new(owner_subkeys, Vec::new())?;
+        schema.kind = *b"DFLT";
+        Ok(schema)
+    }
+
     fn validate(&self) -> Result<(), Error> {
-        if self.owner_subkeys == 0 || self.members.len() + 1 > MAX_WRITER_COUNT {
-            return Err(Error::InvalidSchema);
-        }
-        let mut writers = std::collections::HashSet::new();
-        for member in &self.members {
-            if member.subkeys == 0 || !writers.insert(member.writer) {
-                return Err(Error::InvalidSchema);
-            }
-        }
-        if self.subkey_count() > MAX_SUBKEY_COUNT {
+        let writers: std::collections::HashSet<_> = self
+            .members
+            .iter()
+            .filter(|m| m.subkeys > 0)
+            .map(|m| m.writer)
+            .collect();
+        let writer_count = writers.len() + usize::from(self.owner_subkeys > 0);
+        if self.members.len() > 256
+            || writer_count > MAX_WRITER_COUNT
+            || self.subkey_count() == 0
+            || self.subkey_count() > MAX_SUBKEY_COUNT
+        {
             return Err(Error::InvalidSchema);
         }
         Ok(())
@@ -98,7 +106,7 @@ impl Schema {
     /// Veilid's compiled SMPL form: the bytes the owner signs.
     pub fn compile(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(6 + self.members.len() * MEMBER_ENTRY);
-        out.extend_from_slice(&FCC_SMPL);
+        out.extend_from_slice(&self.kind);
         out.extend_from_slice(&self.owner_subkeys.to_le_bytes());
         for member in &self.members {
             out.extend_from_slice(&member.writer);
@@ -109,7 +117,11 @@ impl Schema {
 
     /// Parse and validate a compiled schema.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() == 6 && bytes[..4] == *b"DFLT" {
+            return Self::dflt(u16::from_le_bytes([bytes[4], bytes[5]]));
+        }
         if bytes.len() < 6
+            || bytes.len() > 6 + 256 * MEMBER_ENTRY
             || bytes[..4] != FCC_SMPL
             || !(bytes.len() - 6).is_multiple_of(MEMBER_ENTRY)
         {
@@ -117,7 +129,9 @@ impl Schema {
         }
         let owner_subkeys = u16::from_le_bytes([bytes[4], bytes[5]]);
         let members = bytes[6..]
-            .chunks_exact(MEMBER_ENTRY)
+            .as_chunks::<MEMBER_ENTRY>()
+            .0
+            .iter()
             .map(|entry| {
                 let mut writer = [0u8; 32];
                 writer.copy_from_slice(&entry[..32]);
@@ -147,20 +161,11 @@ impl Schema {
         None
     }
 
-    /// The subkeys `writer` may write (empty if it is not a writer).
-    pub fn subkeys_of(&self, owner: &PublicKey, writer: &PublicKey) -> std::ops::Range<u32> {
-        if writer == owner {
-            return 0..u32::from(self.owner_subkeys);
-        }
-        let mut start = u32::from(self.owner_subkeys);
-        for member in &self.members {
-            let end = start + u32::from(member.subkeys);
-            if member.writer == *writer {
-                return start..end;
-            }
-            start = end;
-        }
-        0..0
+    /// All subkeys writable by this key, including repeated SMPL member entries.
+    pub fn subkeys_of(&self, owner: &PublicKey, writer: &PublicKey) -> Vec<u32> {
+        (0..self.subkey_count() as u32)
+            .filter(|s| self.writer_of(owner, *s).as_ref() == Some(writer))
+            .collect()
     }
 
     /// Check a write against the schema (Veilid `check_subkey_value_data_smpl`).

@@ -7,13 +7,13 @@
 //! (the vault) can persist them in its encrypted store.
 //!
 //! **Epochs.** A schema never changes (the record key is derived from it), so a new
-//! writer set means a new record. Subkey 0 of every record belongs to the owner and holds
+//! writer set means a new record. For the optional epoch API, subkey 0 belongs to the owner and holds
 //! the [`Header`]: the epoch number and links to the predecessor and successor records.
 //! [`Dht::rotate`] creates the next epoch and links the old record to it; readers
 //! follow the links with [`Dht::latest`].
 
 use crate::backend::{Backend, Change, SetOutcome, WatchId};
-use crate::crypto::{EncryptionKey, Signer, Verifier};
+use crate::crypto::{EncryptionKey, RecordCipher, Signer, Verifier};
 use crate::{Descriptor, Error, RecordKey, Schema, SignedValue};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -140,18 +140,25 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
                 client.state.descriptors.insert(key, descriptor);
             }
         }
-        client.state.queue = state
-            .queue
-            .into_iter()
-            .filter(|write| {
-                client.validated(&write.key).is_ok_and(|(owner, schema)| {
-                    write
-                        .value
-                        .validate(&write.key, &owner, &schema, write.subkey, &client.verifier)
-                        .is_ok()
-                })
-            })
-            .collect();
+        for write in state.queue {
+            if client.validated(&write.key).is_ok_and(|(owner, schema)| {
+                write
+                    .value
+                    .validate(&write.key, &owner, &schema, write.subkey, &client.verifier)
+                    .is_ok()
+            }) {
+                let value = match client.cached(&write.key, write.subkey) {
+                    Some(current) if current.seq >= write.value.seq => current.clone(),
+                    _ => write.value,
+                };
+                client.remember(&write.key, write.subkey, value.clone());
+                client
+                    .state
+                    .queue
+                    .retain(|q| !(q.key == write.key && q.subkey == write.subkey));
+                client.state.queue.push(QueuedWrite { value, ..write });
+            }
+        }
         client
     }
 
@@ -173,12 +180,45 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         ))
     }
 
-    /// Create a record owned by `owner` with `schema`, and write its header (epoch 0).
+    /// Sign and cache a descriptor without network I/O. Call inside the key owner's
+    /// synchronous authorization callback, persist [`Self::state`], then flush queued values.
+    /// This is local preparation, never evidence that peers retained the record.
+    pub fn queue_create(
+        &mut self,
+        schema: &Schema,
+        owner: &impl Signer,
+    ) -> Result<RecordKey, Error> {
+        let descriptor = Descriptor::create(schema, owner)?;
+        descriptor.validate(&self.verifier)?;
+        let key = descriptor.key();
+        self.state.descriptors.insert(key, descriptor);
+        Ok(key)
+    }
+
+    /// Create an ordinary Veilid record with no reserved or pre-populated subkeys.
+    /// The signed descriptor is retained locally when the network is unavailable.
     pub async fn create(
         &mut self,
         schema: &Schema,
         owner: &impl Signer,
-        encryption: Option<&EncryptionKey>,
+    ) -> Result<RecordKey, Error> {
+        let descriptor = Descriptor::create(schema, owner)?;
+        descriptor.validate(&self.verifier)?;
+        let key = descriptor.key();
+        match self.backend.create(&descriptor).await {
+            Ok(()) | Err(Error::Unavailable) => {}
+            Err(error) => return Err(error),
+        }
+        self.state.descriptors.insert(key, descriptor);
+        Ok(key)
+    }
+
+    /// Create an optional application epoch record and write its header (epoch 0).
+    pub async fn create_epoch(
+        &mut self,
+        schema: &Schema,
+        owner: &impl Signer,
+        encryption: Option<&dyn RecordCipher>,
     ) -> Result<RecordKey, Error> {
         self.create_with_header(
             schema,
@@ -197,14 +237,13 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         &mut self,
         schema: &Schema,
         owner: &impl Signer,
-        encryption: Option<&EncryptionKey>,
+        encryption: Option<&dyn RecordCipher>,
         header: &Header,
     ) -> Result<RecordKey, Error> {
-        let descriptor = Descriptor::create(schema, owner)?;
-        descriptor.validate(&self.verifier)?;
-        let key = descriptor.key();
-        self.backend.create(&descriptor).await?;
-        self.state.descriptors.insert(key, descriptor);
+        if schema.owner_subkeys() == 0 {
+            return Err(Error::InvalidSchema);
+        }
+        let key = self.create(schema, owner).await?;
         self.write_header(&key, header, owner, encryption).await?;
         Ok(key)
     }
@@ -214,14 +253,37 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
     pub async fn open(&mut self, key: &RecordKey) -> Result<Schema, Error> {
         match self.backend.descriptor(key).await {
             Ok(Some(descriptor)) => {
-                let schema = descriptor.validate_for(key, &self.verifier)?;
+                descriptor.validate_for(key, &self.verifier)?;
                 self.state.descriptors.insert(*key, descriptor);
-                Ok(schema)
             }
-            Ok(None) => Err(Error::UnknownRecord),
-            Err(Error::Unavailable) => Ok(self.validated(key)?.1),
-            Err(error) => Err(error),
+            Ok(None) | Err(Error::UnknownRecord | Error::Unavailable) => {
+                self.validated(key).map_err(|_| Error::UnknownRecord)?;
+            }
+            Err(error) => return Err(error),
         }
+        // Republish cached signed values verbatim, without private signing keys.
+        // The backend performs replication and returns any newer network value.
+        let descriptor = self
+            .state
+            .descriptors
+            .get(key)
+            .ok_or(Error::NotOpen)?
+            .clone();
+        match self.backend.create(&descriptor).await {
+            Ok(()) | Err(Error::Unavailable) => {}
+            Err(error) => return Err(error),
+        }
+        let values = self.state.values.get(key).cloned().unwrap_or_default();
+        for (subkey, value) in values {
+            let result = self.backend.rehydrate(key, subkey, &value).await;
+            // A failed inspection is retried on the next open, not converted to a
+            // blind write by flush. Existing explicitly queued writes remain queued.
+            if matches!(result, Err(Error::Unavailable | Error::UnknownRecord)) {
+                continue;
+            }
+            self.accept_result(key, subkey, value, result)?;
+        }
+        Ok(self.validated(key)?.1)
     }
 
     /// The owner and schema of an opened record.
@@ -235,14 +297,37 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         &mut self,
         key: &RecordKey,
         subkey: u32,
-        encryption: Option<&EncryptionKey>,
+        encryption: Option<&dyn RecordCipher>,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, Error> {
         match self.get_signed(key, subkey).await? {
             None => Ok(None),
-            Some(value) => Ok(Some(match encryption {
-                Some(encryption) => encryption.open(&key.0, subkey, &value.data)?,
-                None => Zeroizing::new(value.data),
-            })),
+            Some(value) => Ok(Some(self.open_value(key, subkey, &value, encryption)?)),
+        }
+    }
+
+    /// Validate and open original signed bytes synchronously under a scoped key
+    /// capability. Fetch with [`Self::get_signed`] first, then call this inside the
+    /// key owner's callback; neither signer nor cipher crosses a network await.
+    pub fn open_value(
+        &self,
+        key: &RecordKey,
+        subkey: u32,
+        value: &SignedValue,
+        encryption: Option<&dyn RecordCipher>,
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
+        let (owner, schema) = self.validated(key)?;
+        value.validate(key, &owner, &schema, subkey, &self.verifier)?;
+        Self::decrypt(value, encryption)
+    }
+
+    fn decrypt(
+        value: &SignedValue,
+        encryption: Option<&dyn RecordCipher>,
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
+        match (encryption, value.nonce) {
+            (Some(key), Some(nonce)) => key.crypt(&nonce, &value.data),
+            (None, None) => Ok(Zeroizing::new(value.data.clone())),
+            _ => Err(Error::Decrypt),
         }
     }
 
@@ -261,7 +346,12 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
                 remote.validate(key, &owner, &schema, subkey, &self.verifier)?;
                 self.remember(key, subkey, remote);
             }
-            Ok(None) | Err(Error::Unavailable) => {}
+            Ok(None) => {}
+            Err(Error::Unavailable | Error::UnknownRecord) => {
+                if self.cached(key, subkey).is_none() {
+                    return Err(Error::Unavailable);
+                }
+            }
             Err(error) => return Err(error),
         }
         Ok(self.cached(key, subkey).cloned())
@@ -293,20 +383,75 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         subkey: u32,
         data: &[u8],
         writer: &impl Signer,
-        encryption: Option<&EncryptionKey>,
+        encryption: Option<&dyn RecordCipher>,
     ) -> Result<WriteOutcome, Error> {
+        let value = self.signed_write(key, subkey, data, writer, encryption)?;
+        let seq = value.seq;
+        let outcome = self.send(key, subkey, value).await?;
+        // Upstream compares decrypted ValueData with the requested value. A fresh
+        // nonce for unchanged plaintext does not turn an idempotent set into a conflict.
+        if matches!(outcome, WriteOutcome::Stale { current_seq } if current_seq == seq)
+            && let Some(current) = self.cached(key, subkey)
+            && current.writer == writer.public_key()
+            && Self::decrypt(current, encryption)?.as_slice() == data
+        {
+            return Ok(WriteOutcome::Written { seq });
+        }
+        Ok(outcome)
+    }
+
+    /// Sign and queue one value synchronously, without carrying a signer across
+    /// an await. Persist the signed state through the vault's protected transaction
+    /// before calling [`Self::flush`]. The result is a local sequence, not a receipt.
+    pub fn queue_set(
+        &mut self,
+        key: &RecordKey,
+        subkey: u32,
+        data: &[u8],
+        writer: &impl Signer,
+        encryption: Option<&dyn RecordCipher>,
+    ) -> Result<u32, Error> {
+        let value = self.signed_write(key, subkey, data, writer, encryption)?;
         let (owner, schema) = self.validated(key)?;
-        let payload = match encryption {
-            Some(encryption) => encryption.seal(&key.0, subkey, data)?,
-            None => data.to_vec(),
-        };
-        schema.check_write(&owner, subkey, &writer.public_key(), payload.len())?;
+        value.validate(key, &owner, &schema, subkey, &self.verifier)?;
+        let seq = value.seq;
+        self.queue_write(key, subkey, &value);
+        Ok(seq)
+    }
+
+    fn signed_write(
+        &self,
+        key: &RecordKey,
+        subkey: u32,
+        data: &[u8],
+        writer: &impl Signer,
+        encryption: Option<&dyn RecordCipher>,
+    ) -> Result<SignedValue, Error> {
+        let (owner, schema) = self.validated(key)?;
+        schema.check_write(&owner, subkey, &writer.public_key(), data.len())?;
         let seq = match self.cached(key, subkey) {
-            Some(current) => current.seq.checked_add(1).ok_or(Error::SeqExhausted)?,
+            Some(current)
+                if current.writer == writer.public_key()
+                    && Self::decrypt(current, encryption)?.as_slice() == data =>
+            {
+                return Ok(current.clone());
+            }
+            Some(current) => current
+                .seq
+                .checked_add(1)
+                .filter(|seq| *seq <= crate::MAX_SEQ)
+                .ok_or(Error::SeqExhausted)?,
             None => 0,
         };
-        let value = SignedValue::sign(key, subkey, seq, payload, writer)?;
-        self.send(key, subkey, value).await
+        let (payload, nonce) = match encryption {
+            Some(encryption) => {
+                let mut nonce = [0; 24];
+                getrandom::fill(&mut nonce).map_err(|_| Error::Randomness)?;
+                (encryption.crypt(&nonce, data)?.to_vec(), Some(nonce))
+            }
+            None => (data.to_vec(), None),
+        };
+        SignedValue::sign_with_nonce(&owner, subkey, seq, payload, nonce, writer)
     }
 
     async fn send(
@@ -315,30 +460,62 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         subkey: u32,
         value: SignedValue,
     ) -> Result<WriteOutcome, Error> {
+        let (owner, schema) = self.validated(key)?;
+        value.validate(key, &owner, &schema, subkey, &self.verifier)?;
+        // Stage before the first await: cancellation after a partial network write
+        // must leave both the signed value and its retry obligation in the snapshot.
+        self.queue_write(key, subkey, &value);
+        let result = self.backend.set(key, subkey, &value).await;
+        self.accept_result(key, subkey, value, result)
+    }
+
+    fn queue_write(&mut self, key: &RecordKey, subkey: u32, value: &SignedValue) {
+        self.state
+            .queue
+            .retain(|q| !(q.key == *key && q.subkey == subkey));
+        self.state.queue.push(QueuedWrite {
+            key: *key,
+            subkey,
+            value: value.clone(),
+        });
+        self.remember(key, subkey, value.clone());
+    }
+
+    fn accept_result(
+        &mut self,
+        key: &RecordKey,
+        subkey: u32,
+        value: SignedValue,
+        result: Result<SetOutcome, Error>,
+    ) -> Result<WriteOutcome, Error> {
         let seq = value.seq;
-        match self.backend.set(key, subkey, &value).await {
+        match result {
             Ok(SetOutcome::Accepted) => {
+                self.state
+                    .queue
+                    .retain(|q| !(q.key == *key && q.subkey == subkey));
                 self.remember(key, subkey, value);
                 Ok(WriteOutcome::Written { seq })
             }
             Ok(SetOutcome::Newer(current)) => {
                 let (owner, schema) = self.validated(key)?;
                 current.validate(key, &owner, &schema, subkey, &self.verifier)?;
+                if current.seq < value.seq {
+                    return Err(Error::Conflict);
+                }
                 let current_seq = current.seq;
-                self.remember(key, subkey, current);
-                Ok(WriteOutcome::Stale { current_seq })
-            }
-            Err(Error::Unavailable) => {
-                // A newer queued write for the same subkey supersedes an older one.
                 self.state
                     .queue
-                    .retain(|queued| !(queued.key == *key && queued.subkey == subkey));
-                self.state.queue.push(QueuedWrite {
-                    key: *key,
-                    subkey,
-                    value: value.clone(),
-                });
-                self.remember(key, subkey, value);
+                    .retain(|q| !(q.key == *key && q.subkey == subkey));
+                self.state
+                    .values
+                    .entry(*key)
+                    .or_default()
+                    .insert(subkey, current);
+                Ok(WriteOutcome::Stale { current_seq })
+            }
+            Err(Error::Unavailable | Error::UnknownRecord) => {
+                self.queue_write(key, subkey, &value);
                 Ok(WriteOutcome::Queued { seq })
             }
             Err(error) => Err(error),
@@ -348,41 +525,25 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
     /// Send queued writes in order until the backend is unreachable again.
     pub async fn flush(&mut self) -> Result<FlushReport, Error> {
         let mut report = FlushReport::default();
-        let queue = std::mem::take(&mut self.state.queue);
-        let mut pending = queue.into_iter();
-        while let Some(write) = pending.next() {
-            match self
-                .backend
-                .set(&write.key, write.subkey, &write.value)
-                .await
-            {
-                Ok(SetOutcome::Accepted) => report.written += 1,
-                Ok(SetOutcome::Newer(current)) => {
-                    let valid = self.validated(&write.key).is_ok_and(|(owner, schema)| {
-                        current
-                            .validate(&write.key, &owner, &schema, write.subkey, &self.verifier)
-                            .is_ok()
-                    });
-                    if valid {
-                        // Replace the optimistic local value with the backend's.
-                        if let Some(values) = self.state.values.get_mut(&write.key) {
-                            values.insert(write.subkey, current);
-                        }
-                    }
-                    report.stale.push((write.key, write.subkey));
-                }
-                Err(Error::Unavailable) => {
-                    self.state.queue.push(write);
-                    break;
-                }
-                Err(error) => {
-                    self.state.queue.push(write);
-                    self.state.queue.extend(pending);
-                    return Err(error);
-                }
+        // Leave each queued write in place until its validated acknowledgment arrives.
+        while let Some(write) = self.state.queue.first().cloned() {
+            let descriptor = self
+                .state
+                .descriptors
+                .get(&write.key)
+                .ok_or(Error::NotOpen)?
+                .clone();
+            match self.backend.create(&descriptor).await {
+                Ok(()) => {}
+                Err(Error::Unavailable) => break,
+                Err(error) => return Err(error),
+            }
+            match self.send(&write.key, write.subkey, write.value).await? {
+                WriteOutcome::Written { .. } => report.written += 1,
+                WriteOutcome::Stale { .. } => report.stale.push((write.key, write.subkey)),
+                WriteOutcome::Queued { .. } => break,
             }
         }
-        self.state.queue.extend(pending);
         report.remaining = self.state.queue.len();
         Ok(report)
     }
@@ -407,7 +568,7 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
     pub async fn header(
         &mut self,
         key: &RecordKey,
-        encryption: Option<&EncryptionKey>,
+        encryption: Option<&dyn RecordCipher>,
     ) -> Result<Header, Error> {
         let data = self
             .get(key, HEADER_SUBKEY, encryption)
@@ -421,7 +582,7 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         key: &RecordKey,
         header: &Header,
         owner: &impl Signer,
-        encryption: Option<&EncryptionKey>,
+        encryption: Option<&dyn RecordCipher>,
     ) -> Result<(), Error> {
         let bytes = serde_json::to_vec(header).map_err(|_| Error::Encoding)?;
         match self
@@ -442,10 +603,10 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         &mut self,
         old: &RecordKey,
         old_owner: &impl Signer,
-        old_encryption: Option<&EncryptionKey>,
+        old_encryption: Option<&dyn RecordCipher>,
         schema: &Schema,
         new_owner: &impl Signer,
-        new_encryption: Option<&EncryptionKey>,
+        new_encryption: Option<&dyn RecordCipher>,
     ) -> Result<RecordKey, Error> {
         let (owner, _) = self.validated(old)?;
         if owner != old_owner.public_key() {
@@ -491,12 +652,27 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
     ) -> Result<RecordKey, Error> {
         let mut current = *key;
         for _ in 0..MAX_EPOCH_HOPS {
-            let header = self.header(&current, encryption(&current).as_ref()).await?;
+            let header = self
+                .header(
+                    &current,
+                    encryption(&current)
+                        .as_ref()
+                        .map(|key| key as &dyn RecordCipher),
+                )
+                .await?;
             let Some(next) = header.successor else {
                 return Ok(current);
             };
             self.open(&next).await?;
-            let next_header = match self.header(&next, encryption(&next).as_ref()).await {
+            let next_header = match self
+                .header(
+                    &next,
+                    encryption(&next)
+                        .as_ref()
+                        .map(|key| key as &dyn RecordCipher),
+                )
+                .await
+            {
                 Ok(next_header) => next_header,
                 // A successor this reader cannot read (no or wrong key) ends the walk.
                 Err(Error::Decrypt | Error::Encoding) => return Ok(current),

@@ -4,11 +4,12 @@ Write all code comments and documentation in English.
 
 ## Product boundary
 
-- Signed replicated records with Veilid DHT semantics (SMPL schema, record key
+- Signed replicated records with Veilid DHT semantics (DFLT/SMPL schemas, record key
   derivation and limits identical to Veilid), a client with offline queue, watch,
-  encryption and epochs, the `Backend` port with the in-memory filling, and the sync
+  VLD0 encryption and optional epochs, the `Backend` / `Network` ports, independent
+  capacity-bounded node stores, closest-node replication, and the sync
   rules (per-device logs, hybrid logical clock, monotonic tombstones, keep-both).
-- No secret keys: sign and verify through the `Signer` / `Verifier` ports.
+- No production secret keys: sign/verify through `Signer` / `Verifier` and encrypt/open through scoped `RecordCipher`; independent upstream read-capability codecs are not a Keys export path.
 - No network code: remote fillings come through `cmsh`'s DHT capability (no layer
   skipping; never depend on `veilid-core` here).
 - No policy: which records exist and who may write them is decided by `cvlt`.
@@ -21,11 +22,13 @@ Write all code comments and documentation in English.
 ## Layout
 
 - `src/schema.rs`, `src/record.rs`: schema, descriptor, record key, signed value.
-- `src/backend.rs`: `Backend` port, `LocalBackend`.
+- `src/backend.rs`: `Backend` port, capacity-bounded `LocalBackend`.
+- `src/network.rs`: `Network` port, `NetworkBackend`, read agreement and write fanout.
+- `src/veilid_capnp.rs`: unchanged upstream generated record modules (MPL-2.0).
 - `src/client.rs`: `Dht`, queue, epochs, `ClientState`.
 - `src/crypto.rs`: ports and record encryption.
 - `src/sync.rs`: sync rules.
-- `tests/common`: VLD0 test doubles for the ports.
+- `tests/common`: actual maintained dalek VLD0 signing and verification for fixtures.
 
 ## Quality boundary
 
