@@ -322,8 +322,8 @@ impl<N: Network, V: Verifier> Backend for NetworkBackend<N, V> {
         // Upstream rehydrate.rs requires at least one answered inspection. Silence
         // is not evidence of absence and must not trigger blind republishing.
         let report = self.read_target(key, subkey, SET_VALUE_COUNT).await?;
-        if report.agreement >= SET_VALUE_COUNT
-            && let Some(remote) = report.value
+        if let Some(remote) = report.value
+            && report.agreement >= SET_VALUE_COUNT
             && remote.seq >= value.seq
         {
             self.rechecked
@@ -348,20 +348,38 @@ impl<N: Network, V: Verifier> Backend for NetworkBackend<N, V> {
 
     async fn watch(&self, key: &RecordKey) -> Result<WatchId, Error> {
         self.cached_descriptor(key)?;
+        // Refuse exhausted or interrupted local bookkeeping before allocating
+        // any remote lease. Opaque local IDs are never reused after failure.
+        let id = {
+            let _watches = self.watches.lock().map_err(|_| Error::Unavailable)?;
+            let mut next = self.next_watch.lock().map_err(|_| Error::Unavailable)?;
+            let id = WatchId(*next);
+            *next = next.checked_add(1).ok_or(Error::Unavailable)?;
+            id
+        };
         for node in self.peers(key).await? {
             if let Ok(remote) = self.network.watch(&node, key).await {
-                let mut watches = self.watches.lock().map_err(|_| Error::Unavailable)?;
-                let mut next = self.next_watch.lock().map_err(|_| Error::Unavailable)?;
-                let id = WatchId(*next);
-                *next = next.checked_add(1).ok_or(Error::Unavailable)?;
-                watches.insert(
-                    id,
-                    RemoteWatch {
-                        node,
-                        remote,
-                        key: *key,
-                    },
-                );
+                let stored = self
+                    .watches
+                    .lock()
+                    .map(|mut watches| {
+                        watches.insert(
+                            id,
+                            RemoteWatch {
+                                node,
+                                remote,
+                                key: *key,
+                            },
+                        );
+                    })
+                    .is_ok();
+                if !stored {
+                    // An interruption while the request was pending must not
+                    // deliberately abandon an accepted lease. Cancellation can
+                    // itself be uncertain; report failure and retain no authority.
+                    let _ = self.network.cancel_watch(&node, remote).await;
+                    return Err(Error::Unavailable);
+                }
                 return Ok(id);
             }
         }
@@ -399,3 +417,7 @@ impl<N: Network, V: Verifier> Backend for NetworkBackend<N, V> {
         Ok(changes)
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "../tests/support/network_state.rs"]
+mod tests;

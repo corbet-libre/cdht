@@ -7,16 +7,19 @@
 //!   checked against the owner-signed writer set on every hop ([`SignedValue`]).
 //!   Authorisation is part of the data structure.
 //! - [`Dht`]: open / get / set / **watch**, an **offline write queue**, optional
-//!   per-record **encryption**, and **epochs** (a new writer set is a new record linked
-//!   from the old one) for device removal.
+//!   per-record **encryption**. Application formats belong to the data-owning libraries.
 //! - Fillings behind the [`Backend`] port: [`LocalBackend`] (one in-memory node) and
 //!   [`NetworkBackend`] (replication over the caller's [`Network`] port). Tor and
 //!   Veilid transport adapters plug in through `cmsh`'s DHT capability.
-//! - [`sync`]: the rules for the member's private state on top — per-device logs, hybrid
-//!   logical clock, monotonic tombstones, keep-both on concurrent edits.
 //!
 //! `cdht` holds no secret keys (signing goes through the [`Signer`] port), contains no
 //! network code and no policy: `cvlt` decides which records exist and who writes them.
+
+#[cfg(test)]
+extern crate self as cdht;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_crypto;
 
 #[rustfmt::skip]
 #[allow(missing_docs, dead_code, clippy::all)]
@@ -30,14 +33,11 @@ mod network;
 mod record;
 pub mod rpc;
 mod schema;
-pub mod sync;
 
 pub use backend::{
     Backend, Capacity, Change, LocalBackend, MAX_WATCH_MS, PUBLIC_WATCH_LIMIT, SetOutcome, WatchId,
 };
-pub use client::{
-    ClientState, Dht, FlushReport, HEADER_SUBKEY, Header, MAX_EPOCH_HOPS, QueuedWrite, WriteOutcome,
-};
+pub use client::{ClientState, Dht, FlushReport, QueuedWrite, WriteOutcome};
 pub use crypto::{EncryptionKey, RecordCipher, Signer, Verifier};
 pub use error::Error;
 pub use network::{

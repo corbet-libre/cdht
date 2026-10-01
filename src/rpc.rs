@@ -9,6 +9,12 @@ use crate::crypto::{PublicKey, Signature};
 use crate::{Descriptor, Error, SignedValue, Signer, Verifier, veilid_capnp as wire};
 use capnp::message::{Builder, HeapAllocator, Reader, ReaderOptions, ReaderSegments};
 use capnp::serialize::OwnedSegments;
+mod answer;
+mod changed;
+mod watch;
+pub use answer::{Answer, Response, UnverifiedPeerInfoBytes};
+pub use changed::{ChangeHint, Statement, value_changed};
+pub use watch::SubkeyRanges;
 const KIND: u32 = u32::from_be_bytes(*b"VLD0");
 /// Upstream ENV0 maximum uncompressed message size; transport framing is separate.
 pub const MAX_RPC_BYTES: usize = 65507;
@@ -32,7 +38,7 @@ fn canonical(message: Builder<HeapAllocator>) -> Result<Builder<HeapAllocator>, 
     let message = if message.len() > 1 {
         let root = message
             .get_root_as_reader::<capnp::any_pointer::Reader>()
-            .map_err(|_| Error::Encoding)?;
+            .expect("generated builder owns its root");
         let size = root.target_size().map_err(|_| Error::Encoding)?.word_count + 1;
         if size > 8192 {
             return Err(Error::ValueTooLarge);
@@ -40,7 +46,7 @@ fn canonical(message: Builder<HeapAllocator>) -> Result<Builder<HeapAllocator>, 
         let mut canonical = Builder::new(HeapAllocator::new().first_segment_words(size as u32));
         canonical
             .set_root_canonical(root)
-            .map_err(|_| Error::Encoding)?;
+            .expect("builder pointers were constructed or checked during deep copy");
         canonical
     } else {
         message
@@ -57,8 +63,10 @@ fn bytes(message: Builder<HeapAllocator>) -> Result<Vec<u8>, Error> {
 }
 fn packed(message: Builder<HeapAllocator>) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
+    // Upstream write_message documents only writer errors. Vec's writer appends
+    // or allocation aborts; it cannot return an I/O failure.
     capnp::serialize_packed::write_message(&mut out, &canonical(message)?)
-        .map_err(|_| Error::Encoding)?;
+        .expect("Vec writer cannot return an I/O error");
     if out.len() > MAX_RPC_BYTES {
         return Err(Error::ValueTooLarge);
     }
@@ -231,8 +239,10 @@ impl SignedOperation {
         })
     }
     /// Authenticate original bytes for the exact destination and expected signer.
-    /// A transport adapter must obtain that expected signer from authenticated
-    /// node information, never from an untrusted coordinate supplied with the RPC.
+    /// For a node-signed RPC, bind the expected key to authenticated node information.
+    /// WatchValue instead uses the watcher capability, which is distinct from the
+    /// transport node. Its verified key does not grant a member quota or establish
+    /// a routing coordinate; the storage owner must authorize that separately.
     pub fn verify(
         bytes: Vec<u8>,
         destination: &PublicKey,
@@ -280,6 +290,19 @@ impl SignedOperation {
 
 /// The supported original upstream record questions. No writer secret is accepted.
 pub enum Query {
+    /// Original WatchValueQ: create, renew, or cancel an upstream node lease.
+    Watch {
+        /// Public record locator.
+        key: crate::RecordKey,
+        /// Inclusive subkey ranges; empty means the complete record upstream.
+        subkeys: SubkeyRanges,
+        /// Requested duration in upstream TimestampDuration microseconds.
+        duration_us: u64,
+        /// Remaining notification count; zero cancels a nonzero watch_id.
+        count: u32,
+        /// Zero requests a new watch; nonzero refers to this node's existing lease.
+        watch_id: u64,
+    },
     /// Read one subkey and optionally its signed descriptor.
     Get {
         /// Public locator.
@@ -316,12 +339,17 @@ fn key_decode(reader: wire::opaque_record_key::Reader<'_>) -> Result<crate::Reco
         reader.get_value(),
     )?))
 }
+fn random_id() -> Result<u64, Error> {
+    let mut bytes = [0; 8];
+    getrandom::fill(&mut bytes).map_err(|_| Error::Randomness)?;
+    Ok(u64::from_ne_bytes(bytes))
+}
 impl Question {
-    /// Encode a GetValueQ or SetValueQ using the unchanged upstream schema.
+    /// Encode a supported record question using the unchanged upstream schema.
     pub fn new(query: &Query) -> Result<Self, Error> {
-        let mut random = [0; 8];
-        getrandom::fill(&mut random).map_err(|_| Error::Randomness)?;
-        let id = u64::from_ne_bytes(random);
+        Self::encode(query, random_id()?)
+    }
+    fn encode(query: &Query, id: u64) -> Result<Self, Error> {
         let mut message = Builder::new_default();
         let mut operation = message.init_root::<wire::operation::Builder>();
         operation.set_op_id(id);
@@ -329,6 +357,22 @@ impl Question {
         question.reborrow().get_respond_to().set_sender(());
         let detail = question.get_detail();
         match query {
+            Query::Watch {
+                key,
+                subkeys,
+                duration_us,
+                count,
+                watch_id,
+            } => {
+                watch::encode(
+                    key,
+                    subkeys,
+                    *duration_us,
+                    *count,
+                    *watch_id,
+                    detail.init_watch_value_q(),
+                )?;
+            }
             Query::Get {
                 key,
                 subkey,
@@ -383,12 +427,19 @@ impl Question {
 /// Decode a previously authenticated question. Signed values remain untrusted
 /// until checked against the requested record's descriptor and subkey.
 pub fn query(operation: &SignedOperation) -> Result<(u64, Query), Error> {
-    let message = read(operation.operation())?;
+    decode_query(operation.operation())
+}
+fn decode_query(operation: &[u8]) -> Result<(u64, Query), Error> {
+    let message = read(operation)?;
+    // Callers hold immutable bytes from Question::encode or SignedOperation's
+    // checked constructor. Nested question fields are still hostile inputs.
     let root = message
         .get_root::<wire::operation::Reader>()
-        .map_err(|_| Error::Encoding)?;
-    let wire::operation::kind::Question(question) =
-        root.get_kind().which().map_err(|_| Error::Encoding)?
+        .expect("operation root checked at construction");
+    let wire::operation::kind::Question(question) = root
+        .get_kind()
+        .which()
+        .expect("operation kind checked at construction")
     else {
         return Err(Error::Encoding);
     };
@@ -403,6 +454,7 @@ pub fn query(operation: &SignedOperation) -> Result<(u64, Query), Error> {
         return Err(Error::Encoding);
     }
     let query = match question.get_detail().which().map_err(|_| Error::Encoding)? {
+        wire::question::detail::WatchValueQ(q) => watch::decode(q.map_err(|_| Error::Encoding)?)?,
         wire::question::detail::GetValueQ(q) => {
             let q = q.map_err(|_| Error::Encoding)?;
             Query::Get {
@@ -430,3 +482,7 @@ pub fn query(operation: &SignedOperation) -> Result<(u64, Query), Error> {
     };
     Ok((root.get_op_id(), query))
 }
+
+#[cfg(test)]
+#[path = "../tests/support/rpc_encoding.rs"]
+mod encoding_tests;

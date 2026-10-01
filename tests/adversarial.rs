@@ -13,16 +13,36 @@ struct Faulty {
     inner: LocalBackend<TestVerifier>,
     reply: Arc<Mutex<Option<SignedValue>>>,
     hang: Arc<std::sync::atomic::AtomicBool>,
+    corrupt_reply: Arc<std::sync::atomic::AtomicU8>,
+}
+impl Faulty {
+    fn receive(&self, stage: u8) -> Result<(), Error> {
+        if self
+            .corrupt_reply
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == stage
+        {
+            // The operation ran against the actual store, then its transport
+            // reply was corrupted. Use the real bounded record decoder.
+            let _ = cdht::rpc::DescriptorBytes::from_bytes(vec![0xff; 8])?;
+        }
+        Ok(())
+    }
 }
 impl Backend for Faulty {
     async fn create(&self, d: &Descriptor) -> Result<(), Error> {
-        self.inner.create(d).await
+        self.inner.create(d).await?;
+        self.receive(1)
     }
     async fn descriptor(&self, k: &RecordKey) -> Result<Option<Descriptor>, Error> {
-        self.inner.descriptor(k).await
+        let result = self.inner.descriptor(k).await?;
+        self.receive(2)?;
+        Ok(result)
     }
     async fn get(&self, k: &RecordKey, s: u32) -> Result<Option<SignedValue>, Error> {
-        self.inner.get(k, s).await
+        let result = self.inner.get(k, s).await?;
+        self.receive(3)?;
+        Ok(result)
     }
     async fn set(&self, k: &RecordKey, s: u32, v: &SignedValue) -> Result<SetOutcome, Error> {
         if self.hang.load(std::sync::atomic::Ordering::Relaxed) {
@@ -31,7 +51,9 @@ impl Backend for Faulty {
         if let Some(value) = self.reply.lock().unwrap().clone() {
             return Ok(SetOutcome::Newer(value));
         }
-        self.inner.set(k, s, v).await
+        let result = self.inner.set(k, s, v).await?;
+        self.receive(4)?;
+        Ok(result)
     }
     async fn watch(&self, k: &RecordKey) -> Result<WatchId, Error> {
         self.inner.watch(k).await
@@ -52,6 +74,7 @@ fn forged_flush_reply_keeps_the_queue_and_cache() {
             inner: LocalBackend::new(TestVerifier),
             reply: Arc::new(Mutex::new(None)),
             hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            corrupt_reply: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
         let owner = key(1);
         let mut client = Dht::new(backend.clone(), TestVerifier);
@@ -187,6 +210,7 @@ fn cancellation_after_dispatch_keeps_a_signed_retry() {
             inner: LocalBackend::new(TestVerifier),
             reply: Arc::new(Mutex::new(None)),
             hang: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            corrupt_reply: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
         let owner = key(1);
         let mut client = Dht::new(backend.clone(), TestVerifier);
@@ -210,5 +234,104 @@ fn cancellation_after_dispatch_keeps_a_signed_retry() {
             backend.inner.get(&record, 0).await.unwrap().unwrap().data,
             b"pending"
         );
+    });
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn malformed_backend_replies_never_acknowledge_or_discard_signed_intent() {
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    block_on(async {
+        let backend = Faulty {
+            inner: LocalBackend::new(TestVerifier),
+            reply: Arc::new(Mutex::new(None)),
+            hang: Arc::new(AtomicBool::new(false)),
+            corrupt_reply: Arc::new(AtomicU8::new(0)),
+        };
+        let owner = key(60);
+        let schema = Schema::dflt(1).unwrap();
+        let locator = Descriptor::create(&schema, &owner).unwrap().key();
+        let mut client = Dht::new(backend.clone(), TestVerifier);
+        backend.corrupt_reply.store(1, Ordering::Relaxed);
+        assert_eq!(
+            client.create(&schema, &owner).await.unwrap_err(),
+            Error::Encoding
+        );
+        assert_eq!(client.schema(&locator).unwrap_err(), Error::NotOpen);
+        assert!(backend.inner.descriptor(&locator).await.unwrap().is_some());
+        backend.corrupt_reply.store(2, Ordering::Relaxed);
+        assert_eq!(client.open(&locator).await.unwrap_err(), Error::Encoding);
+        backend.corrupt_reply.store(1, Ordering::Relaxed);
+        assert_eq!(client.open(&locator).await.unwrap_err(), Error::Encoding);
+        backend.corrupt_reply.store(0, Ordering::Relaxed);
+        client.open(&locator).await.unwrap();
+        client
+            .set(&locator, 0, b"original", &owner, None)
+            .await
+            .unwrap();
+        let before = serde_json::to_vec(client.state()).unwrap();
+        backend.corrupt_reply.store(3, Ordering::Relaxed);
+        assert_eq!(
+            client.get_signed(&locator, 0).await.unwrap_err(),
+            Error::Encoding
+        );
+        assert_eq!(serde_json::to_vec(client.state()).unwrap(), before);
+        backend.corrupt_reply.store(4, Ordering::Relaxed);
+        assert_eq!(
+            client
+                .set(&locator, 0, b"pending", &owner, None)
+                .await
+                .unwrap_err(),
+            Error::Encoding
+        );
+        let pending = client.state().queue()[0].value.clone();
+        assert_eq!(
+            backend.inner.get(&locator, 0).await.unwrap(),
+            Some(pending.clone())
+        );
+        backend.corrupt_reply.store(1, Ordering::Relaxed);
+        assert_eq!(client.flush().await.unwrap_err(), Error::Encoding);
+        assert_eq!(client.state().queue()[0].value, pending);
+        backend.corrupt_reply.store(0, Ordering::Relaxed);
+        assert_eq!(client.flush().await.unwrap().written, 1);
+        assert!(client.state().queue().is_empty());
+    });
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn replaying_a_genuine_older_signed_response_cannot_acknowledge_a_newer_write() {
+    use std::sync::atomic::{AtomicBool, AtomicU8};
+    block_on(async {
+        let backend = Faulty {
+            inner: LocalBackend::new(TestVerifier),
+            reply: Arc::new(Mutex::new(None)),
+            hang: Arc::new(AtomicBool::new(false)),
+            corrupt_reply: Arc::new(AtomicU8::new(0)),
+        };
+        let owner = key(61);
+        let mut client = Dht::new(backend.clone(), TestVerifier);
+        let locator = client
+            .create(&Schema::dflt(1).unwrap(), &owner)
+            .await
+            .unwrap();
+        client
+            .set(&locator, 0, b"past", &owner, None)
+            .await
+            .unwrap();
+        let past = backend.inner.get(&locator, 0).await.unwrap().unwrap();
+        backend.inner.set_online(false);
+        client
+            .set(&locator, 0, b"future", &owner, None)
+            .await
+            .unwrap();
+        let pending = client.state().queue()[0].value.clone();
+        *backend.reply.lock().unwrap() = Some(past);
+        backend.inner.set_online(true);
+        assert_eq!(client.flush().await.unwrap_err(), Error::Conflict);
+        assert_eq!(client.state().queue()[0].value, pending);
+        *backend.reply.lock().unwrap() = None;
+        assert_eq!(client.flush().await.unwrap().written, 1);
+        assert_eq!(backend.inner.get(&locator, 0).await.unwrap(), Some(pending));
     });
 }

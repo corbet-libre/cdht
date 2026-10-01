@@ -72,11 +72,20 @@ impl EncryptionKey {
 
     /// Apply Veilid's symmetric record cipher. The caller must supply a fresh nonce
     /// for every encryption and verify the signed value before decryption.
+    /// Reject input larger than one upstream subkey before allocating its output.
     pub fn crypt(&self, nonce: &[u8; 24], input: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+        if input.len() > crate::MAX_SUBKEY_SIZE {
+            return Err(Error::ValueTooLarge);
+        }
         let mut out = Zeroizing::new(input.to_vec());
+        // A fresh RustCrypto XChaCha20 starts its u32 block counter at zero.
+        // One bounded 32 KiB subkey cannot exhaust its 64-byte blocks.
+        const {
+            assert!(crate::MAX_SUBKEY_SIZE < u32::MAX as usize);
+        }
         XChaCha20::new((&*self.0).into(), nonce.into())
             .try_apply_keystream(&mut out)
-            .map_err(|_| Error::Crypto)?;
+            .expect("one bounded subkey cannot exhaust a fresh cipher");
         Ok(out)
     }
 

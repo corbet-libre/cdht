@@ -1,12 +1,37 @@
 # cdht
 
-**Signed replicated records with Veilid DHT semantics, and the sync rules for a member's
-own devices.**
+**Signed replicated records with Veilid DHT semantics.**
 
-`cdht` replaces the former lineage and sync libraries of the member vault with one
-building block, the DHT record. Authorisation is part of the data structure: the owner
-signs the schema, the schema lists the writers and their subkeys, and every write is
-checked against it wherever it lands.
+Authorisation is part of the record: the owner signs the schema, the schema lists
+writers and subkeys, and every write is checked wherever it lands.
+
+## Scope
+
+**Purpose.** Carry encrypted vault, device and offline-message records over either
+network backend using Veilid-compatible schemas, descriptors, signatures and VLD0.
+
+**Owns.** Record validation, create/open/get/set/watch, an offline write queue,
+owner rehydration, bounded device-node storage and the Veilid replication rules.
+Application data stays opaque. All subkeys are available to the record owner.
+
+**Never.** Store operator records, impose record expiry, invent retention or
+consensus, interpret application sync or membership formats, retain signing keys,
+or perform socket I/O. Missing replicas never establish an empty vault.
+Domain libraries own per-device logs, clocks, keep-both and tombstones inside
+record contents; they compress and pad before Records encrypts.
+
+**States and ports.** Queued → flushed writes; leased watches with explicit loss;
+Available / Unavailable reads. `Dht`, `Backend`, `Network`, and scoped `Signer`,
+`Verifier`, `RecordCipher` capabilities. Mesh carries original signed record RPC
+bytes. The device stores its own copy and serves other records while in use.
+
+**Invariants and tests.** Preserve original signatures and nonces; no secret-key
+export or operator record store. Upstream native/Wasm byte conformance, queue,
+watch, capacity/LRU, conflict and rehydration tests are required. Active-device-loss
+restore and Tor-to-Veilid import require real network evidence beyond format tests.
+See [CONTRACT](docs/CONTRACT.md), [CONFORMANCE](docs/CONFORMANCE.md) and
+[CHURN](docs/CHURN.md) for the exact incomplete production seams and failed churn
+acceptance evidence. No retention or complete restore claim is made here.
 
 ## Records
 
@@ -19,9 +44,9 @@ checked against it wherever it lands.
 | Limits | 32 KiB per subkey, 1 MiB per record, 1024 subkeys, 256 writers | same constants |
 | Encryption | optional per-record key, XChaCha20, nonce authenticated by the value signature | encrypted records |
 
-DFLT and SMPL match the pinned Veilid schemas, including zero owner slots,
+DFLT and SMPL match the referenced Veilid schemas, including zero owner slots,
 zero-sized member entries, repeated writers and owner-as-member slots. Ordinary
-`create` leaves every subkey empty. `create_epoch` opts into the application header.
+`create` leaves every subkey empty.
 
 Value signatures use Veilid's legacy owner/subkey/sequence/data input for clear
 records, and its unpacked Cap'n Proto blob input for encrypted records. Record
@@ -38,12 +63,6 @@ to the same subkey supersedes a queued one; stale queued writes are reported); p
 state (`ClientState`, no secrets) is re-validated on resume; nothing a backend returns is
 trusted.
 
-**Epochs:** a schema never changes, so a new writer set (device removal) is a new record:
-`rotate` creates it (new owner key and encryption key allowed), writes the predecessor
-link into its header and the successor link into the old header; `latest` follows the
-chain and stops before a successor the reader cannot decrypt — a removed device keeps
-only the old epoch.
-
 ## Backends and network port
 
 `NetworkBackend<N, V>` performs closest-node fanout over `Network`: five write
@@ -52,48 +71,34 @@ validated conflict responses and owner rehydration of existing signed values.
 `LocalBackend` is one independently bounded node store, with native/browser
 capacity presets, LRU eviction, no record expiry and bounded public watch leases.
 
-Mesh supplies actual transport and durable node storage. The current Mesh DHT
-hook loses signatures/nonces and therefore needs revision before it can carry
-these records. [NETWORK-PORT](docs/NETWORK-PORT.md) specifies the integration.
+Mesh supplies message transport. Its previous signature/nonce-losing DHT
+hook has been retired; the replacement runtime adapter and durable node store
+remain incomplete. [NETWORK-PORT](docs/NETWORK-PORT.md) specifies the integration.
 The future Veilid adapter must import and republish existing signed values;
 calling a signing `set_dht_value` API alone is insufficient.
 
 `cdht` contains no network implementation and never depends on `veilid-core` in
-production. Its dedicated conformance CI job builds the pinned upstream as an
+production. Its dedicated conformance CI job builds an exact upstream revision as an
 independent oracle. [CHURN](docs/CHURN.md) describes the simulated population
 measurements; they are not live Tor measurements.
-
-## Sync rules (`sync`)
-
-No CRDT library. Per-device signed logs (each device writes its own subkeys), ordered by a
-hybrid logical clock (monotonic despite wrong device clocks, bounded drift); each edit
-names its base versions; concurrent versions are kept (**keep both**, the member
-chooses; an edit based on all heads resolves it); tombstones are monotonic. Logs split
-into subkey-sized segments and compact without changing the merged state.
 
 ## Crypto ports
 
 `Signer` and `Verifier` are ports: `cdht` never holds a secret key. In the vault, `cvlt`
-adapts `ckmg` (VLD0: Ed25519ph with context `VLD0_SIGN`); the tests use an ed25519-dalek
-double with the same semantics. This also keeps `cdht` free of private dependencies, so
+adapts `ckmg` (VLD0: Ed25519ph with context `VLD0_SIGN`); the tests use the maintained ed25519-dalek
+implementation with the same semantics. This also keeps `cdht` free of private dependencies, so
 its CI runs on hosted runners.
 
 ## Boundaries
 
-No policy (which records exist and who writes them is `cvlt`'s lineage rules), no secret
-keys, no network code, no recovery.
+No application policy: data owners choose records and writer sets; `ckmg` owns device
+lineage. No secret keys or socket code. Restore depends on available peer records.
 
 ## Open points / TODO
 
 - Mesh/Tor and Veilid adapter integration (above).
 - Group membership without a server (MLS commit arbitration) is a separate design topic
   (`cgrp`), not part of `cdht`.
-- A removed device still holds the old owner key and could write a competing successor
-  link into the old record; readers should prefer the chain the vault confirms (see
-  `cvlt`). Open question recorded there.
-- Per-subkey writes of log segments rewrite whole segments; incremental segment updates
-  are an optimisation for later.
-
 ## License
 
 Copyright 2026 Julian Y. Richard Corbet. Licensed under
@@ -106,3 +111,8 @@ See [LICENSE.md](LICENSE.md).
 Dependency updates follow main and are tested against one CI-resolved lockfile.
 Line and branch coverage target 100%; failures remain blocking. See
 [the coverage contract](docs/COVERAGE.md) for measurement and exclusions.
+
+Watch RPC range encoding reuses upstream's maintained `range-set-blaze` 0.6
+collection. The codec retains upstream microsecond durations, notification count
+and node-local lease identifiers; it does not introduce a watch policy or timer.
+Actual upstream WatchValueQ/WatchValueA coders supply independent byte vectors.

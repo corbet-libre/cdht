@@ -75,6 +75,14 @@ pub async fn generate() {
         .get_dht_record_key(schema.clone(), owner.clone(), Some(secret.clone()))
         .await
         .unwrap();
+    let descriptor = SignedValueDescriptor::make_signature(
+        owner.clone(),
+        schema.compile().into(),
+        &vcrypto,
+        owner_secret.clone(),
+    )
+    .await
+    .unwrap();
     let mut values = vec![];
     for size in [0usize, 1, 7, 8, 9, 127, 1024, 8191, 8192, 32768] {
         for seq in [0u32, 1, u32::MAX - 1] {
@@ -108,7 +116,11 @@ pub async fn generate() {
                 )
                 .unwrap();
                 let value_blob = crate::rpc_processor::cdht_rpc_bytes(rpc_value);
+                let changed = crate::rpc_processor::cdht_changed(Some(signed.clone()));
+                let (get_answer, set_answer, set_question) =
+                    crate::rpc_processor::cdht_record_answers(signed.clone(), descriptor.clone());
                 values.push(serde_json::json!({"seq":seq, "encrypted": encrypted,
+                    "valueChanged": b64(changed), "getAnswer": b64(get_answer), "setAnswer": b64(set_answer), "setQuestion": b64(set_question),
                     "plaintext": b64(&plain), "data": b64(&ciphertext),
                     "blob": b64(signed.value_data().raw_blob()), "rpcValue": b64(&value_blob), "signature": b64(signed.signature().ref_value())}));
             }
@@ -137,8 +149,14 @@ pub async fn generate() {
         owner.clone(),
         signature,
     );
+    let watches: Vec<_> = crate::rpc_processor::cdht_watch_vectors()
+        .into_iter()
+        .map(
+            |(question, answer)| serde_json::json!({"question":b64(question),"answer":b64(answer)}),
+        )
+        .collect();
     let output = serde_json::json!({"commit":"dd8e2cdd72b5bf817172ac31c20872b168c5c8fc",
-        "rpcOperation":b64(&operation_data), "rpcPacket":b64(&rpc_packet), "schemas":schema_vectors, "schema":b64(schema.compile()), "owner":b64(owner.ref_value()),
+        "changeCancelled": b64(crate::rpc_processor::cdht_changed(None)), "watches":watches, "rpcOperation":b64(&operation_data), "rpcPacket":b64(&rpc_packet), "schemas":schema_vectors, "schema":b64(schema.compile()), "owner":b64(owner.ref_value()),
         "writer":b64(writer.ref_value()), "full_key":full_key.to_string(), "values":values});
     std::fs::write(
         std::env::var("CDHT_VECTORS").unwrap(),
@@ -146,4 +164,133 @@ pub async fn generate() {
     )
     .unwrap();
     api.shutdown().await;
+    import_original_record_into_native_store().await;
+}
+
+// Real upstream StorageManager and TableStore. Never attach to a network here;
+// this proves byte-preserving import/reopen, not owner fanout or Tor restore.
+async fn import_original_record_into_native_store() {
+    use crate::storage_manager::{InboundGetValueResult, InboundSetValueResult};
+    let input: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(std::env::var("CDHT_IMPORT").unwrap()).unwrap())
+            .unwrap();
+    let decode = |v: &serde_json::Value| {
+        BASE64URL_NOPAD
+            .decode(v.as_str().unwrap().as_bytes())
+            .unwrap()
+    };
+    let descriptor_bytes = decode(&input["descriptor"]);
+    let value_bytes = decode(&input["value"]);
+    let descriptor_message =
+        capnp::serialize::read_message(&mut &descriptor_bytes[..], Default::default()).unwrap();
+    let value_message =
+        capnp::serialize::read_message(&mut &value_bytes[..], Default::default()).unwrap();
+    let descriptor =
+        crate::rpc_processor::cdht_descriptor_decode(&descriptor_message.get_root().unwrap())
+            .unwrap();
+    let value =
+        crate::rpc_processor::cdht_value_decode(&value_message.get_root().unwrap()).unwrap();
+    let record: OpaqueRecordKey = input["key"].as_str().unwrap().parse().unwrap();
+    let target = Target::NodeId(NodeId::new(CRYPTO_KIND_VLD0, BareNodeId::new(&[9; 32])));
+    let (callback, mut config) = tests::fixture_veilid_core_with_namespace("cdht-import");
+    let api = api_startup(callback.clone(), config.clone()).await.unwrap();
+    {
+        let storage = api.core_context().unwrap().registry().storage_manager();
+        let forged = SignedValueData::new(
+            value.value_data().clone(),
+            Signature::new(CRYPTO_KIND_VLD0, BareSignature::new(&[0; 64])),
+        );
+        let refusal = storage
+            .inbound_set_value(
+                &record,
+                0,
+                Arc::new(forged),
+                Some(Arc::new(descriptor.clone())),
+                target.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(!matches!(
+            refusal,
+            NetworkResult::Value(InboundSetValueResult::Success)
+        ));
+        let NetworkResult::Value(InboundGetValueResult::Success(before)) =
+            storage.inbound_get_value(&record, 0, true).await.unwrap()
+        else {
+            panic!("inspect empty store");
+        };
+        assert!(before.opt_value.is_none());
+        let accepted = storage
+            .inbound_set_value(
+                &record,
+                0,
+                Arc::new(value.clone()),
+                Some(Arc::new(descriptor.clone())),
+                target,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            accepted,
+            NetworkResult::Value(InboundSetValueResult::Success)
+        ));
+        storage
+            .cdht_import_local_original(&record, descriptor, value)
+            .await;
+    }
+    api.shutdown().await;
+    config.table_store.delete = false;
+    config.block_store.delete = false;
+    config.protected_store.delete = false;
+    let reopened = api_startup(callback, config).await.unwrap();
+    {
+        let storage = reopened
+            .core_context()
+            .unwrap()
+            .registry()
+            .storage_manager();
+        let NetworkResult::Value(InboundGetValueResult::Success(stored)) =
+            storage.inbound_get_value(&record, 0, true).await.unwrap()
+        else {
+            panic!("reopen imported store");
+        };
+        let mut encoded_value = capnp::message::Builder::new_default();
+        crate::rpc_processor::cdht_value_encode(
+            &stored.opt_value.unwrap(),
+            &mut encoded_value.init_root(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::rpc_processor::cdht_rpc_bytes(encoded_value),
+            value_bytes
+        );
+        let mut encoded_descriptor = capnp::message::Builder::new_default();
+        crate::rpc_processor::cdht_descriptor_encode(
+            &stored.opt_descriptor.unwrap(),
+            &mut encoded_descriptor.init_root(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::rpc_processor::cdht_rpc_bytes(encoded_descriptor),
+            descriptor_bytes
+        );
+        let (local_value, local_descriptor) = storage.cdht_reopen_imported_local(&record).await;
+        let mut value = capnp::message::Builder::new_default();
+        crate::rpc_processor::cdht_value_encode(&local_value, &mut value.init_root()).unwrap();
+        assert_eq!(crate::rpc_processor::cdht_rpc_bytes(value), value_bytes);
+        let mut descriptor = capnp::message::Builder::new_default();
+        crate::rpc_processor::cdht_descriptor_encode(
+            &local_descriptor,
+            &mut descriptor.init_root(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::rpc_processor::cdht_rpc_bytes(descriptor),
+            descriptor_bytes
+        );
+    }
+    reopened.shutdown().await;
+    println!(
+        "original Records bytes survived native Veilid remote/local store import and reopen; upstream open queued owner rehydration; network fanout not exercised"
+    );
 }

@@ -20,7 +20,8 @@ synthetic assumptions, not an empirical trace or calibrated prediction:
 - Nodes retain their remote cache while offline. Each day, a deterministic
   1% replacement probability destroys both remote cache and local owner state.
   Replacements keep the simulated node coordinate. Stable synthetic signing
-  keys model surviving synced-passkey access. Lost payloads are not regenerated:
+  keys are supplied fixture capabilities, not a model of passkey root recovery.
+  Lost payloads are not regenerated:
   recovery requires surviving network records.
 - Baseline: one 1-KiB encrypted record per phone with native capacity. Pressure:
   three such records per phone with browser capacity. This comparison changes
@@ -134,3 +135,18 @@ including never-published records, cannot establish that promise. The component
 test `fresh_device_restores_sealed_state_and_offline_messages_without_the_old_device`
 proves the fresh-client path when replicas survive, with injected key capabilities;
 it is not a WebAuthn/PRF, full identity/membership or real-Tor integration test.
+
+
+## Equal-passkey restore boundary
+
+The common identity root is random. Every enrolled passkey protects its own
+wrapped copy in member DHT records; no first passkey has privileged recovery and
+there is no operator copy. Devices refresh their records during use. If every
+device copy and every recoverable DHT copy is gone, identity and data are lost
+equally for all passkeys. An outage alone does not prove that loss.
+
+The historical churn fixture supplies identity/read capabilities independently.
+Its failures remain failures, and its successes do not prove recovery of the
+wrapped common root. Full acceptance needs the actual owner wrapping/discovery
+ports, restored root copies and all vault/message records with the lost device
+offline. This correction adds no format, retention mechanism or extra replica.

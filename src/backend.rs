@@ -158,10 +158,10 @@ impl LocalState {
                 .iter()
                 .filter(|(key, _)| *key != protected)
                 .min_by_key(|(_, record)| record.touched)
-                .map(|(key, _)| *key);
-            let Some(oldest) = oldest else {
-                break;
-            };
+                .map(|(key, _)| *key)
+                // create and set admit only a protected record that fits by itself.
+                // Exceeding capacity therefore always leaves another record to evict.
+                .expect("admitted protected record fits capacity");
             self.records.remove(&oldest);
             self.watches.retain(|_, w| w.key != oldest);
             self.evictions += 1;
@@ -187,11 +187,10 @@ impl<V: Verifier> Clone for LocalBackend<V> {
 impl<V: Verifier> LocalBackend<V> {
     /// An empty, online store that validates writes with `verifier`.
     pub fn new(verifier: V) -> Self {
-        let capacity = if cfg!(all(target_arch = "wasm32", target_os = "unknown")) {
-            Capacity::BROWSER
-        } else {
-            Capacity::NATIVE
-        };
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let capacity = Capacity::BROWSER;
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let capacity = Capacity::NATIVE;
         Self::with_capacity(verifier, capacity)
     }
 
@@ -307,7 +306,11 @@ impl<V: Verifier> Backend for LocalBackend<V> {
         let key = descriptor.key();
         let mut state = self.lock()?;
         if let Some(existing) = state.records.get(&key) {
-            return if existing.descriptor == *descriptor {
+            // Upstream cmp_no_sig compares authenticated owner and schema.
+            // A second valid signature does not define a different record.
+            return if existing.descriptor.owner == descriptor.owner
+                && existing.descriptor.schema == descriptor.schema
+            {
                 Ok(())
             } else {
                 Err(Error::WrongRecord)
@@ -366,7 +369,11 @@ impl<V: Verifier> Backend for LocalBackend<V> {
         )?;
         state.touch(key);
         let byte_limit = state.capacity.bytes;
-        let record = state.records.get_mut(key).ok_or(Error::UnknownRecord)?;
+        // The same lock has retained the validated record throughout this call.
+        let record = state
+            .records
+            .get_mut(key)
+            .expect("validated record retained");
         if let Some(current) = record.values.get(&subkey) {
             if current.same_value(value) {
                 return Ok(SetOutcome::Accepted);
@@ -391,7 +398,8 @@ impl<V: Verifier> Backend for LocalBackend<V> {
             seq: value.seq,
         };
         for watch in state.watches.values_mut() {
-            if watch.key == *key && watch.remaining > 0 {
+            // Zero-count watches are removed atomically by changes().
+            if watch.key == *key {
                 watch.changes.insert(subkey, change);
             }
         }
@@ -420,3 +428,7 @@ impl<V: Verifier> Backend for LocalBackend<V> {
         Ok(changes)
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "../tests/support/backend_state.rs"]
+mod tests;

@@ -16,7 +16,7 @@ pub enum Error {
     SubkeyOutOfRange,
     /// The value exceeds the schema's size limit.
     ValueTooLarge,
-    /// No more sequence numbers (or epochs).
+    /// No more sequence numbers.
     SeqExhausted,
     /// A descriptor does not belong to the record key, or a different descriptor exists.
     WrongRecord,
@@ -28,22 +28,10 @@ pub enum Error {
     UnknownWatch,
     /// The backend is unreachable (writes are queued).
     Unavailable,
-    /// A concurrent write won (for example two rotations of one record).
+    /// A concurrent write disagrees with the proposed value.
     Conflict,
-    /// The record has no header.
-    MissingHeader,
-    /// Successor/predecessor links are inconsistent.
-    BrokenEpochChain,
     /// Encrypted data did not decrypt (wrong key or modified).
     Decrypt,
-    /// A remote clock is implausibly far ahead.
-    ClockDrift,
-    /// The logical clock counter overflowed.
-    ClockOverflow,
-    /// A device log is inconsistent.
-    InvalidLog,
-    /// A device log does not fit its subkeys; compact it.
-    LogFull,
     /// Signing failed in the signer port.
     Signer,
     /// The platform random number generator failed.
@@ -68,13 +56,7 @@ impl fmt::Display for Error {
             Error::UnknownWatch => "unknown watch",
             Error::Unavailable => "backend unavailable",
             Error::Conflict => "concurrent write won",
-            Error::MissingHeader => "record header missing",
-            Error::BrokenEpochChain => "broken epoch chain",
             Error::Decrypt => "decryption failed",
-            Error::ClockDrift => "remote clock too far ahead",
-            Error::ClockOverflow => "logical clock overflow",
-            Error::InvalidLog => "invalid device log",
-            Error::LogFull => "device log full",
             Error::Signer => "signing failed",
             Error::Randomness => "randomness unavailable",
             Error::Crypto => "cryptographic failure",

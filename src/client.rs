@@ -1,40 +1,17 @@
 //! The client: open, read, write and watch records over any backend, with a local cache,
-//! an offline write queue and epochs.
+//! an offline write queue.
 //!
 //! The client trusts no backend: descriptors and values are validated on arrival. Writes
 //! that cannot reach the backend are applied to the local cache and queued; [`Dht::flush`]
 //! sends them later. The cache and queue are plain data ([`ClientState`]) so the caller
 //! (the vault) can persist them in its encrypted store.
 //!
-//! **Epochs.** A schema never changes (the record key is derived from it), so a new
-//! writer set means a new record. For the optional epoch API, subkey 0 belongs to the owner and holds
-//! the [`Header`]: the epoch number and links to the predecessor and successor records.
-//! [`Dht::rotate`] creates the next epoch and links the old record to it; readers
-//! follow the links with [`Dht::latest`].
-
 use crate::backend::{Backend, Change, SetOutcome, WatchId};
-use crate::crypto::{EncryptionKey, RecordCipher, Signer, Verifier};
+use crate::crypto::{RecordCipher, Signer, Verifier};
 use crate::{Descriptor, Error, RecordKey, Schema, SignedValue};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
-
-/// The owner subkey that holds the record header.
-pub const HEADER_SUBKEY: u32 = 0;
-/// Longest successor chain [`Dht::latest`] follows.
-pub const MAX_EPOCH_HOPS: usize = 64;
-
-/// Record header in owner subkey 0.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Header {
-    /// Epoch number, starting at 0.
-    pub epoch: u32,
-    /// The record this one replaces.
-    pub predecessor: Option<RecordKey>,
-    /// The record that replaces this one, once rotated.
-    pub successor: Option<RecordKey>,
-}
 
 /// What happened to a write.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,41 +190,6 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         Ok(key)
     }
 
-    /// Create an optional application epoch record and write its header (epoch 0).
-    pub async fn create_epoch(
-        &mut self,
-        schema: &Schema,
-        owner: &impl Signer,
-        encryption: Option<&dyn RecordCipher>,
-    ) -> Result<RecordKey, Error> {
-        self.create_with_header(
-            schema,
-            owner,
-            encryption,
-            &Header {
-                epoch: 0,
-                predecessor: None,
-                successor: None,
-            },
-        )
-        .await
-    }
-
-    async fn create_with_header(
-        &mut self,
-        schema: &Schema,
-        owner: &impl Signer,
-        encryption: Option<&dyn RecordCipher>,
-        header: &Header,
-    ) -> Result<RecordKey, Error> {
-        if schema.owner_subkeys() == 0 {
-            return Err(Error::InvalidSchema);
-        }
-        let key = self.create(schema, owner).await?;
-        self.write_header(&key, header, owner, encryption).await?;
-        Ok(key)
-    }
-
     /// Open a record: fetch and validate its descriptor (or use the cached one when the
     /// backend is unreachable). Returns its schema.
     pub async fn open(&mut self, key: &RecordKey) -> Result<Schema, Error> {
@@ -390,12 +332,13 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         let outcome = self.send(key, subkey, value).await?;
         // Upstream compares decrypted ValueData with the requested value. A fresh
         // nonce for unchanged plaintext does not turn an idempotent set into a conflict.
-        if matches!(outcome, WriteOutcome::Stale { current_seq } if current_seq == seq)
-            && let Some(current) = self.cached(key, subkey)
-            && current.writer == writer.public_key()
-            && Self::decrypt(current, encryption)?.as_slice() == data
-        {
-            return Ok(WriteOutcome::Written { seq });
+        if matches!(outcome, WriteOutcome::Stale { current_seq } if current_seq == seq) {
+            // accept_result validated the unique schema writer and retained this
+            // exact stale value before returning. No second writer decision exists.
+            let current = self.cached(key, subkey).expect("stale value retained");
+            if Self::decrypt(current, encryption)?.as_slice() == data {
+                return Ok(WriteOutcome::Written { seq });
+            }
         }
         Ok(outcome)
     }
@@ -430,10 +373,9 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         let (owner, schema) = self.validated(key)?;
         schema.check_write(&owner, subkey, &writer.public_key(), data.len())?;
         let seq = match self.cached(key, subkey) {
-            Some(current)
-                if current.writer == writer.public_key()
-                    && Self::decrypt(current, encryption)?.as_slice() == data =>
-            {
+            // Cached values were validated on arrival, and check_write above
+            // bound this writer to the same unique schema slot.
+            Some(current) if Self::decrypt(current, encryption)?.as_slice() == data => {
                 return Ok(current.clone());
             }
             Some(current) => current
@@ -562,127 +504,5 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
     /// Changes since the last call. Hints only: read the subkeys to get validated data.
     pub async fn changes(&mut self, id: WatchId) -> Result<Vec<Change>, Error> {
         self.backend.changes(id).await
-    }
-
-    /// Read a record's header.
-    pub async fn header(
-        &mut self,
-        key: &RecordKey,
-        encryption: Option<&dyn RecordCipher>,
-    ) -> Result<Header, Error> {
-        let data = self
-            .get(key, HEADER_SUBKEY, encryption)
-            .await?
-            .ok_or(Error::MissingHeader)?;
-        serde_json::from_slice(&data).map_err(|_| Error::Encoding)
-    }
-
-    async fn write_header(
-        &mut self,
-        key: &RecordKey,
-        header: &Header,
-        owner: &impl Signer,
-        encryption: Option<&dyn RecordCipher>,
-    ) -> Result<(), Error> {
-        let bytes = serde_json::to_vec(header).map_err(|_| Error::Encoding)?;
-        match self
-            .set(key, HEADER_SUBKEY, &bytes, owner, encryption)
-            .await?
-        {
-            WriteOutcome::Written { .. } | WriteOutcome::Queued { .. } => Ok(()),
-            WriteOutcome::Stale { .. } => Err(Error::Conflict),
-        }
-    }
-
-    /// Start the next epoch: a new record with `schema` owned by `new_owner` (and
-    /// encrypted with `new_encryption`), whose header points back to `old`; then the old
-    /// record's header, signed by `old_owner`, points forward to it. Use it when the
-    /// writer set changes, for example when a device is removed; give the new record a
-    /// new encryption key so removed writers cannot read it.
-    pub async fn rotate(
-        &mut self,
-        old: &RecordKey,
-        old_owner: &impl Signer,
-        old_encryption: Option<&dyn RecordCipher>,
-        schema: &Schema,
-        new_owner: &impl Signer,
-        new_encryption: Option<&dyn RecordCipher>,
-    ) -> Result<RecordKey, Error> {
-        let (owner, _) = self.validated(old)?;
-        if owner != old_owner.public_key() {
-            return Err(Error::WrongWriter);
-        }
-        let old_header = self.header(old, old_encryption).await?;
-        if old_header.successor.is_some() {
-            return Err(Error::Conflict);
-        }
-        let epoch = old_header.epoch.checked_add(1).ok_or(Error::SeqExhausted)?;
-        let new = self
-            .create_with_header(
-                schema,
-                new_owner,
-                new_encryption,
-                &Header {
-                    epoch,
-                    predecessor: Some(*old),
-                    successor: None,
-                },
-            )
-            .await?;
-        self.write_header(
-            old,
-            &Header {
-                successor: Some(new),
-                ..old_header
-            },
-            old_owner,
-            old_encryption,
-        )
-        .await?;
-        Ok(new)
-    }
-
-    /// Follow successor links from `key` to the newest epoch. `encryption` returns the key
-    /// for each record (records of different epochs usually have different keys);
-    /// following stops before the first successor it cannot read.
-    pub async fn latest(
-        &mut self,
-        key: &RecordKey,
-        encryption: impl Fn(&RecordKey) -> Option<EncryptionKey>,
-    ) -> Result<RecordKey, Error> {
-        let mut current = *key;
-        for _ in 0..MAX_EPOCH_HOPS {
-            let header = self
-                .header(
-                    &current,
-                    encryption(&current)
-                        .as_ref()
-                        .map(|key| key as &dyn RecordCipher),
-                )
-                .await?;
-            let Some(next) = header.successor else {
-                return Ok(current);
-            };
-            self.open(&next).await?;
-            let next_header = match self
-                .header(
-                    &next,
-                    encryption(&next)
-                        .as_ref()
-                        .map(|key| key as &dyn RecordCipher),
-                )
-                .await
-            {
-                Ok(next_header) => next_header,
-                // A successor this reader cannot read (no or wrong key) ends the walk.
-                Err(Error::Decrypt | Error::Encoding) => return Ok(current),
-                Err(error) => return Err(error),
-            };
-            if next_header.predecessor != Some(current) || next_header.epoch <= header.epoch {
-                return Err(Error::BrokenEpochChain);
-            }
-            current = next;
-        }
-        Err(Error::BrokenEpochChain)
     }
 }

@@ -4,6 +4,7 @@ permissions:
 concurrency:
   group: ci
   cancel-in-progress: false
+  queue: max
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
@@ -18,6 +19,8 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || github.sha }}
         persist-credentials: false
     - uses: dtolnay/rust-toolchain@stable
+    - name: Validate the committed dependency snapshot
+      run: python3 .github/check-first-party.py
     - name: Resolve one fresh dependency snapshot
       run: 'cargo update
 
@@ -67,6 +70,8 @@ jobs:
         name: veilid-conformance
         path: 'target/veilid-vectors.json
 
+          target/cdht-import.json
+
           target/veilid-Cargo.lock
 
           Cargo.lock
@@ -103,7 +108,7 @@ jobs:
     - name: Clippy (native, all targets)
       run: cargo clippy --locked --all-targets -- -D warnings
     - name: Test
-      run: cargo test --locked
+      run: cargo test --locked --no-fail-fast
     - name: Clippy (wasm32, browser build)
       run: cargo clippy --locked --lib --target wasm32-unknown-unknown -- -D warnings
     - name: Install matching wasm runner
@@ -132,11 +137,11 @@ jobs:
         echo "$PWD" >> "$GITHUB_PATH"
 
         '
-    - name: Execute actual Wasm records, queues, network and sync vectors
+    - name: Execute actual Wasm records, queues, network and RPC vectors
       env:
         CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
-      run: cargo test --locked --target wasm32-unknown-unknown --test records --test network --test adversarial
-        --test sync --test rpc
+      run: cargo test --locked --target wasm32-unknown-unknown --lib --test records --test network --test adversarial
+        --test rpc
     needs:
     - resolve
   dependency-policy:
@@ -154,10 +159,11 @@ jobs:
         name: resolved-lock
     - run: python3 .github/check-first-party.py
   coverage:
+    # Independent measurements share the resolved lock. Conformance remains a
+    # separate required check; its compile failure must not suppress coverage data.
     needs:
     - resolve
     - check
-    - conformance
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -190,7 +196,7 @@ jobs:
         cargo llvm-cov report --branch --ignore-filename-regex ''/tests/|/veilid_capnp.rs$'' --text --output-path
         coverage.txt'
     - name: Require complete line and branch coverage
-      run: python3 .github/check-source-coverage.py coverage.lcov coverage.json
+      run: python3 .github/test-source-coverage.py && python3 .github/check-source-coverage.py coverage.lcov coverage.json coverage.txt
     - uses: actions/upload-artifact@v4
       if: always()
       with:

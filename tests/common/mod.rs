@@ -1,4 +1,4 @@
-//! Test doubles for the crypto ports with Veilid VLD0 semantics (Ed25519ph, context
+//! Real maintained crypto adapters for fixtures with VLD0 semantics (Ed25519ph, context
 //! `VLD0_SIGN`). In the vault, `cvlt` adapts `ckmg` instead.
 #![allow(dead_code)]
 
@@ -50,5 +50,25 @@ impl Verifier for TestVerifier {
                     &ed25519_dalek::Signature::from_bytes(signature),
                 )
                 .is_ok()
+    }
+}
+
+impl TestKey {
+    /// A second valid signature from maintained dalek for a public test seed.
+    /// Change only the nonce prefix, never the signing scalar or public key.
+    /// This is an interoperability fixture, not a production signing option.
+    pub fn alternative_signature(&self, data: &[u8]) -> Signature {
+        use ed25519_dalek::hazmat::{ExpandedSecretKey, raw_sign_prehashed};
+        let bytes: [u8; 64] = Sha512::digest(self.0.to_bytes()).into();
+        let mut expanded = ExpandedSecretKey::from_bytes(&bytes);
+        expanded.hash_prefix[0] ^= 1;
+        raw_sign_prehashed::<Sha512, _>(
+            &expanded,
+            prehash(data),
+            &self.0.verifying_key(),
+            Some(b"VLD0_SIGN"),
+        )
+        .unwrap()
+        .to_bytes()
     }
 }

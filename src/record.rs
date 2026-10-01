@@ -174,14 +174,14 @@ impl SignedValue {
         if message.len() != 1 {
             let root = message
                 .get_root_as_reader::<capnp::any_pointer::Reader>()
-                .map_err(|_| Error::Encoding)?;
+                .expect("generated builder owns its root");
             let size = root.target_size().map_err(|_| Error::Encoding)?.word_count + 1;
             let mut canonical = capnp::message::Builder::new(
                 capnp::message::HeapAllocator::new().first_segment_words(size as u32),
             );
             canonical
                 .set_root_canonical(root)
-                .map_err(|_| Error::Encoding)?;
+                .expect("generated ValueData contains only valid data pointers");
             Ok(capnp::serialize::write_message_to_words(&canonical))
         } else {
             Ok(capnp::serialize::write_message_to_words(&message))

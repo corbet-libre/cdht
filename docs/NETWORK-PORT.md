@@ -92,6 +92,26 @@ A queued sequence is never an acknowledgement. Existing async convenience APIs
 remain for callers whose signer custody allows them; scoped Keys callers use
 the synchronous staging port.
 
+## Upstream record answers
+
+`rpc::Answer` encodes the original GetValueA/SetValueA/WatchValueA schema and echoes the
+authenticated request ID. `Question::answer` accepts only the matching ID and
+operation kind and validates returned record signatures against the requested
+locator/subkey and owner-signed descriptor. Authenticate the answer's
+`SignedOperation` against the expected node identity before calling it.
+
+PeerInfo hints retain their original NodeInfo message and signature bytes as
+`UnverifiedPeerInfoBytes`; they do not establish an authenticated node coordinate
+or onion endpoint. The routing owner must apply upstream PeerInfo validation.
+WatchValueQ preserves upstream ranges, duration in microseconds, remaining count
+and the node-scoped lease identifier. Accepted WatchValueA responses retain the requested nonzero lease identifier;
+an active accepted lease cannot return identifier zero. These are the upstream
+rpc_call_watch_value checks. A response is not proof of notification delivery or
+automatic renewal. The request signer is the upstream watcher capability (a
+schema member or runtime anonymous watcher), distinct from transport node identity;
+the eventual handler must not grant member quotas from an unverified key claim. The actual watch transport and owner lease scheduler remain unfinished.
+This codec adds no discovery format, handler acknowledgment or storage adapter. The public byte boundary is not real Tor DHT restore evidence.
+
 
 `RecordCipher` supplies the matching scoped encryption boundary. `queue_set`
 accepts the capability synchronously and generates a fresh 24-byte nonce for a
@@ -101,3 +121,9 @@ original signature before invoking the cipher. A closure adapter can map the
 owner's coarse errors without copying its secret or retaining its capability.
 The standalone `EncryptionKey` codec is for independent Veilid interoperability;
 production device paths must not export a Keys secret to construct it.
+
+`rpc::Statement::value_changed` and `rpc::value_changed` preserve upstream
+ValueChanged bytes, including an optional original signed value. Shape decoding
+never authorizes a local watch: match record, authenticated storage node, watch ID
+and requested ranges first. Follow upstream inspection for multi-subkey hints;
+do not treat an included value as a transaction commit or delivery receipt.

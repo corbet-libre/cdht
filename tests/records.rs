@@ -3,8 +3,8 @@
 mod common;
 
 use cdht::{
-    Backend, ClientState, Descriptor, Dht, EncryptionKey, Error, HEADER_SUBKEY, LocalBackend,
-    Member, RecordKey, Schema, SetOutcome, SignedValue, Signer, WriteOutcome,
+    Backend, ClientState, Descriptor, Dht, EncryptionKey, Error, LocalBackend, Member, RecordKey,
+    Schema, SetOutcome, SignedValue, Signer, WriteOutcome,
 };
 use common::{TestKey, TestVerifier, key};
 use futures_executor::block_on;
@@ -159,12 +159,11 @@ fn writes_are_checked_against_the_owner_signed_writer_set() {
         let backend = network();
         let mut dht = client(&backend);
         let record = dht
-            .create_epoch(&two_device_schema(&a, &b), &owner, None)
+            .create(&two_device_schema(&a, &b), &owner)
             .await
             .unwrap();
-        let header = dht.header(&record, None).await.unwrap();
-        assert_eq!(header.epoch, 0);
-        assert_eq!(header.predecessor, None);
+        // No application header is reserved or synthesized.
+        assert!(dht.get(&record, 0, None).await.unwrap().is_none());
 
         assert_eq!(
             dht.set(&record, 1, b"owner data", &owner, None)
@@ -216,7 +215,7 @@ fn sequence_numbers_and_stale_writes() {
         let backend = network();
         let mut first = client(&backend);
         let record = first
-            .create_epoch(&two_device_schema(&a, &b), &owner, None)
+            .create(&two_device_schema(&a, &b), &owner)
             .await
             .unwrap();
         assert_eq!(
@@ -263,7 +262,7 @@ fn offline_writes_are_queued_and_flushed() {
         let backend = network();
         let mut device_a = client(&backend);
         let record = device_a
-            .create_epoch(&two_device_schema(&a, &b), &owner, None)
+            .create(&two_device_schema(&a, &b), &owner)
             .await
             .unwrap();
 
@@ -327,7 +326,7 @@ fn flush_reports_stale_queued_writes() {
         let backend = network();
         let mut offline = client(&backend);
         let record = offline
-            .create_epoch(&two_device_schema(&a, &b), &owner, None)
+            .create(&two_device_schema(&a, &b), &owner)
             .await
             .unwrap();
         let mut online = client(&backend);
@@ -382,7 +381,7 @@ fn watchers_see_changes() {
         let backend = network();
         let mut writer = client(&backend);
         let record = writer
-            .create_epoch(&two_device_schema(&a, &b), &owner, None)
+            .create(&two_device_schema(&a, &b), &owner)
             .await
             .unwrap();
         let mut watcher = client(&backend);
@@ -414,7 +413,7 @@ fn encrypted_records_hide_data_from_the_backend() {
         let backend = network();
         let mut dht = client(&backend);
         let record = dht
-            .create_epoch(&two_device_schema(&a, &b), &owner, Some(&secret))
+            .create(&two_device_schema(&a, &b), &owner)
             .await
             .unwrap();
         dht.set(&record, 2, b"private note", &a, Some(&secret))
@@ -441,100 +440,7 @@ fn encrypted_records_hide_data_from_the_backend() {
                 .as_slice(),
             b"private note"
         );
-        // The header is encrypted too.
-        assert_eq!(dht.header(&record, None).await.unwrap_err(), Error::Decrypt);
-        assert_eq!(dht.header(&record, Some(&secret)).await.unwrap().epoch, 0);
-    });
-}
-
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-fn epochs_link_records_and_exclude_removed_writers() {
-    block_on(async {
-        let (owner, a, b) = (key(1), key(2), key(3));
-        let new_owner = key(4);
-        let old_secret = EncryptionKey::from_bytes([1; 32]);
-        let new_secret = EncryptionKey::from_bytes([2; 32]);
-        let backend = network();
-        let mut dht = client(&backend);
-        let old = dht
-            .create_epoch(&two_device_schema(&a, &b), &owner, Some(&old_secret))
-            .await
-            .unwrap();
-
-        // Remove device B: new writer set, new owner key, new encryption key.
-        let only_a = Schema::new(
-            2,
-            vec![Member {
-                writer: a.public_key(),
-                subkeys: 2,
-            }],
-        )
-        .unwrap();
-        let new = dht
-            .rotate(
-                &old,
-                &owner,
-                Some(&old_secret),
-                &only_a,
-                &new_owner,
-                Some(&new_secret),
-            )
-            .await
-            .unwrap();
-        assert_ne!(new, old);
-        let old_header = dht.header(&old, Some(&old_secret)).await.unwrap();
-        assert_eq!(old_header.successor, Some(new));
-        let new_header = dht.header(&new, Some(&new_secret)).await.unwrap();
-        assert_eq!((new_header.epoch, new_header.predecessor), (1, Some(old)));
-
-        // B is no writer of the new epoch.
-        assert_eq!(
-            dht.set(&new, 4, b"b", &b, Some(&new_secret))
-                .await
-                .unwrap_err(),
-            Error::SubkeyOutOfRange
-        );
-        dht.set(&new, 2, b"a", &a, Some(&new_secret)).await.unwrap();
-
-        // A reader holding both keys follows to the newest epoch; B, knowing only the old
-        // key, stops at the old record.
-        let mut reader = client(&backend);
-        reader.open(&old).await.unwrap();
-        let keys = |k: &RecordKey| {
-            if *k == old {
-                Some(old_secret.clone())
-            } else if *k == new {
-                Some(new_secret.clone())
-            } else {
-                None
-            }
-        };
-        assert_eq!(reader.latest(&old, keys).await.unwrap(), new);
-        let only_old = |k: &RecordKey| (*k == old).then(|| old_secret.clone());
-        assert_eq!(reader.latest(&old, only_old).await.unwrap(), old);
-
-        // A record rotates once.
-        assert_eq!(
-            dht.rotate(
-                &old,
-                &owner,
-                Some(&old_secret),
-                &only_a,
-                &new_owner,
-                Some(&new_secret)
-            )
-            .await
-            .unwrap_err(),
-            Error::Conflict
-        );
-        // Only the owner rotates.
-        assert_eq!(
-            dht.rotate(&new, &a, Some(&new_secret), &only_a, &a, None)
-                .await
-                .unwrap_err(),
-            Error::WrongWriter
-        );
+        assert_eq!(dht.get(&record, 2, None).await.unwrap_err(), Error::Decrypt);
     });
 }
 
@@ -546,10 +452,13 @@ fn client_state_persists_and_is_revalidated() {
         let backend = network();
         let mut dht = client(&backend);
         let record = dht
-            .create_epoch(&two_device_schema(&a, &b), &owner, None)
+            .create(&two_device_schema(&a, &b), &owner)
             .await
             .unwrap();
         dht.set(&record, 2, b"kept", &a, None).await.unwrap();
+        dht.set(&record, 0, b"owner data", &owner, None)
+            .await
+            .unwrap();
 
         let json = serde_json::to_string(dht.state()).unwrap();
         let state: ClientState = serde_json::from_str(&json).unwrap();
@@ -564,13 +473,7 @@ fn client_state_persists_and_is_revalidated() {
                 .as_slice(),
             b"kept"
         );
-        assert!(
-            resumed
-                .get(&record, HEADER_SUBKEY, None)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(resumed.get(&record, 0, None).await.unwrap().is_some());
 
         // Tampered persisted values are dropped on resume.
         let b64 = |bytes: &[u8]| data_encoding::BASE64URL_NOPAD.encode(bytes);
@@ -690,5 +593,444 @@ fn scoped_cipher_opens_only_authenticated_values() {
             reader.open_value(&record, 0, &value, Some(&refused)),
             Err(Error::Crypto)
         );
+    });
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn independent_read_capabilities_refuse_malformed_keys_and_redact_debug() {
+    let owner = key(42);
+    let record = Descriptor::create(&Schema::dflt(1).unwrap(), &owner)
+        .unwrap()
+        .key();
+    let secret = EncryptionKey::from_bytes([57; 32]);
+    let capability = secret.record_key(&record);
+    let (parsed, decoded) = EncryptionKey::parse_record_key(&capability).unwrap();
+    assert_eq!(parsed, record);
+    let nonce = [23; 24];
+    let plaintext = b"private record";
+    assert_eq!(
+        decoded.unwrap().crypt(&nonce, plaintext).unwrap(),
+        secret.crypt(&nonce, plaintext).unwrap()
+    );
+    assert!(
+        EncryptionKey::parse_record_key(&record.to_string())
+            .unwrap()
+            .1
+            .is_none()
+    );
+    for malformed in [
+        "",
+        "VLD1:AAAA",
+        "VLD0:",
+        "VLD0:!",
+        "VLD0:AAAA:!",
+        "VLD0:AAAA:AAAA",
+        "VLD0:a:b:c",
+    ] {
+        assert_eq!(
+            EncryptionKey::parse_record_key(malformed).unwrap_err(),
+            Error::Encoding
+        );
+    }
+    assert_eq!(format!("{secret:?}"), "EncryptionKey([redacted])");
+    assert!(!format!("{secret:?}").contains(capability.as_str()));
+    assert!(format!("{record:?}").contains(&record.to_string()));
+    assert!("VLD0:!".parse::<RecordKey>().is_err());
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn schemas_and_signed_values_refuse_out_of_bounds_external_structures() {
+    let owner = key(43);
+    let schema = Schema::dflt(1).unwrap();
+    assert!(schema.members().is_empty());
+    let record = Descriptor::create(&schema, &owner).unwrap().key();
+    let member = Member {
+        writer: owner.public_key(),
+        subkeys: 1,
+    };
+    assert_eq!(
+        Schema::new(1, vec![member; 257]).unwrap_err(),
+        Error::InvalidSchema
+    );
+    let writers: Vec<_> = (0..256u16)
+        .map(|i| {
+            let mut writer = [0; 32];
+            writer[..2].copy_from_slice(&i.to_le_bytes());
+            Member { writer, subkeys: 1 }
+        })
+        .collect();
+    assert_eq!(Schema::new(1, writers).unwrap_err(), Error::InvalidSchema);
+    for malformed in [
+        vec![],
+        vec![0; 6 + 257 * 34],
+        b"NONE\x01\0".to_vec(),
+        b"SMPL\x01\0x".to_vec(),
+    ] {
+        assert_eq!(Schema::parse(&malformed).unwrap_err(), Error::InvalidSchema);
+    }
+    assert_eq!(
+        SignedValue::sign(&owner.public_key(), 0, u32::MAX, vec![], &owner).unwrap_err(),
+        Error::SeqExhausted
+    );
+    assert_eq!(
+        SignedValue::sign(
+            &owner.public_key(),
+            0,
+            0,
+            vec![0; cdht::MAX_SUBKEY_SIZE + 1],
+            &owner
+        )
+        .unwrap_err(),
+        Error::ValueTooLarge
+    );
+    let value = SignedValue::sign(&owner.public_key(), 0, 0, vec![1], &owner).unwrap();
+    let other_writer = key(59);
+    let independently_signed =
+        SignedValue::sign(&other_writer.public_key(), 0, 0, vec![1], &other_writer).unwrap();
+    assert!(!value.same_value(&independently_signed));
+    let mut altered = value.clone();
+    altered.seq = u32::MAX;
+    assert_eq!(altered.raw_blob().unwrap_err(), Error::SeqExhausted);
+    assert_eq!(
+        altered
+            .validate(&record, &owner.public_key(), &schema, 0, &TestVerifier)
+            .unwrap_err(),
+        Error::SeqExhausted
+    );
+    altered = value.clone();
+    altered.data.resize(cdht::MAX_SUBKEY_SIZE + 1, 0);
+    assert_eq!(altered.raw_blob().unwrap_err(), Error::ValueTooLarge);
+    assert_eq!(
+        value
+            .validate(
+                &RecordKey([0; 32]),
+                &owner.public_key(),
+                &schema,
+                0,
+                &TestVerifier
+            )
+            .unwrap_err(),
+        Error::WrongRecord
+    );
+    let mut original = SignedValue::from_blob(value.raw_blob().unwrap(), value.signature).unwrap();
+    original
+        .validate(&record, &owner.public_key(), &schema, 0, &TestVerifier)
+        .unwrap();
+    original.data[0] ^= 1;
+    assert_eq!(original.raw_blob().unwrap_err(), Error::Encoding);
+    assert!(!original.same_value(&value));
+    assert!(!original.same_value(&original.clone()));
+    assert_eq!(
+        SignedValue::from_blob(vec![0; cdht::MAX_SUBKEY_SIZE + 1025], [0; 64]).unwrap_err(),
+        Error::ValueTooLarge
+    );
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn recovering_a_mixed_queue_preserves_other_records_and_subkeys() {
+    block_on(async {
+        let backend = network();
+        let a = key(55);
+        let b = key(56);
+        let mut original = client(&backend);
+        let ra = original
+            .create(&Schema::dflt(2).unwrap(), &a)
+            .await
+            .unwrap();
+        let rb = original
+            .create(&Schema::dflt(2).unwrap(), &b)
+            .await
+            .unwrap();
+        backend.set_online(false);
+        for (record, signer) in [(&rb, &b), (&ra, &a)] {
+            for subkey in 0..2 {
+                assert!(matches!(
+                    original
+                        .set(record, subkey, &[subkey as u8], signer, None)
+                        .await
+                        .unwrap(),
+                    WriteOutcome::Queued { seq: 0 }
+                ));
+            }
+        }
+        let state: ClientState =
+            serde_json::from_slice(&serde_json::to_vec(original.state()).unwrap()).unwrap();
+        let mut restored = Dht::with_state(backend.clone(), TestVerifier, state);
+        assert_eq!(restored.state().queue().len(), 4);
+        backend.set_online(true);
+        let concurrent =
+            SignedValue::sign(&b.public_key(), 0, 1, b"another device".to_vec(), &b).unwrap();
+        backend.set(&rb, 0, &concurrent).await.unwrap();
+        let flushed = restored.flush().await.unwrap();
+        assert_eq!(flushed.written, 3);
+        assert_eq!(flushed.stale, vec![(rb, 0)]);
+        assert!(restored.state().queue().is_empty());
+        assert_eq!(restored.get_signed(&rb, 0).await.unwrap(), Some(concurrent));
+        for (record, subkey) in [(ra, 0), (ra, 1), (rb, 1)] {
+            assert_eq!(
+                restored
+                    .get(&record, subkey, None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                &[subkey as u8]
+            );
+        }
+    });
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn record_cipher_bounds_match_the_upstream_subkey_boundary() {
+    let key = EncryptionKey::from_bytes([57; 32]);
+    let nonce = [58; 24];
+    for length in [0, cdht::MAX_SUBKEY_SIZE] {
+        let original = vec![9; length];
+        let ciphertext = key.crypt(&nonce, &original).unwrap();
+        assert_eq!(key.crypt(&nonce, &ciphertext).unwrap().as_slice(), original);
+    }
+    assert_eq!(
+        key.crypt(&nonce, &vec![0; cdht::MAX_SUBKEY_SIZE + 1])
+            .unwrap_err(),
+        Error::ValueTooLarge
+    );
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn scoped_cipher_adapter_executes_under_custody_and_unchanged_write_keeps_nonce() {
+    use cdht::RecordCipher;
+    block_on(async {
+        let backend = LocalBackend::new(TestVerifier);
+        let owner = key(44);
+        let secret = EncryptionKey::from_bytes([17; 32]);
+        let capability = |nonce: &[u8; 24], input: &[u8]| secret.crypt(nonce, input);
+        let mut dht = Dht::new(backend.clone(), TestVerifier);
+        let record = dht.create(&Schema::dflt(1).unwrap(), &owner).await.unwrap();
+        dht.set(
+            &record,
+            0,
+            b"same",
+            &owner,
+            Some(&capability as &dyn RecordCipher),
+        )
+        .await
+        .unwrap();
+        let original = dht.get_signed(&record, 0).await.unwrap().unwrap();
+        assert_eq!(
+            dht.set(&record, 0, b"same", &owner, Some(&capability))
+                .await
+                .unwrap(),
+            WriteOutcome::Written { seq: 0 }
+        );
+        assert_eq!(dht.get_signed(&record, 0).await.unwrap().unwrap(), original);
+        assert_eq!(
+            dht.open_value(&record, 0, &original, Some(&capability))
+                .unwrap()
+                .as_slice(),
+            b"same"
+        );
+    });
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn imported_retry_snapshots_recover_only_authenticated_latest_values() {
+    block_on(async {
+        let owner = key(1);
+        let backend = network();
+        let mut original = client(&backend);
+        let record = original
+            .queue_create(&Schema::dflt(2).unwrap(), &owner)
+            .unwrap();
+        original
+            .queue_set(&record, 0, b"first", &owner, None)
+            .unwrap();
+        let first = serde_json::to_value(original.state()).unwrap()["queue"][0].clone();
+        original
+            .queue_set(&record, 0, b"latest", &owner, None)
+            .unwrap();
+        original
+            .queue_set(&record, 1, b"other subkey", &owner, None)
+            .unwrap();
+        let snapshot = serde_json::to_value(original.state()).unwrap();
+        let locator = record.to_string();
+        // A valid retry survives loss of its redundant cache. Duplicate imported
+        // retries coalesce, and stale retries never roll back a newer cache.
+        for remove_cache in [false, true] {
+            let mut state = snapshot.clone();
+            if remove_cache {
+                state["values"] = serde_json::json!({});
+            }
+            state["queue"]
+                .as_array_mut()
+                .unwrap()
+                .insert(0, first.clone());
+            let mut resumed = Dht::with_state(
+                backend.clone(),
+                TestVerifier,
+                serde_json::from_value(state).unwrap(),
+            );
+            assert_eq!(resumed.state().queue().len(), 2);
+            let pending = resumed
+                .state()
+                .queue()
+                .iter()
+                .find(|q| q.subkey == 0)
+                .unwrap();
+            assert_eq!(pending.value.seq, 1);
+            assert_eq!(pending.value.data, b"latest");
+            assert_eq!(resumed.flush().await.unwrap().written, 2);
+            assert_eq!(
+                resumed
+                    .get(&record, 0, None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                b"latest"
+            );
+            assert_eq!(
+                resumed.get_signed(&record, 2).await.unwrap_err(),
+                Error::SubkeyOutOfRange
+            );
+        }
+        // A valid signature cannot authorize another locator/subkey, and a forged
+        // signature in both the cache and queue cannot become a retry obligation.
+        for case in 0..4 {
+            let mut state = snapshot.clone();
+            match case {
+                0 => {
+                    state["descriptors"][&locator]["signature"] =
+                        serde_json::json!(data_encoding::BASE64URL_NOPAD.encode(&[0; 64]));
+                }
+                1 => {
+                    state["queue"][0]["key"] = serde_json::json!(RecordKey([42; 32]).to_string());
+                    state["values"] = serde_json::json!({});
+                }
+                2 => {
+                    state["queue"][0]["subkey"] = serde_json::json!(2);
+                    state["values"] = serde_json::json!({});
+                }
+                3 => {
+                    state["queue"][0]["value"]["signature"] =
+                        serde_json::json!(data_encoding::BASE64URL_NOPAD.encode(&[0; 64]));
+                    state["values"][&locator]["0"] = state["queue"][0]["value"].clone();
+                }
+                _ => unreachable!(),
+            }
+            let resumed = Dht::with_state(
+                network(),
+                TestVerifier,
+                serde_json::from_value(state).unwrap(),
+            );
+            assert!(resumed.state().queue().iter().all(|q| q.subkey == 1));
+            if case == 0 {
+                assert_eq!(resumed.schema(&record).unwrap_err(), Error::NotOpen);
+                assert!(resumed.state().queue().is_empty());
+            }
+        }
+        assert_eq!(original.schema(&record).unwrap().1.owner_subkeys(), 2);
+    });
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn public_record_errors_never_contain_record_data() {
+    for (error, message) in [
+        (Error::Encoding, "malformed data"),
+        (Error::InvalidSchema, "invalid schema"),
+        (Error::BadSignature, "signature did not verify"),
+        (Error::WrongWriter, "writer not allowed for this subkey"),
+        (Error::SubkeyOutOfRange, "subkey out of range"),
+        (Error::ValueTooLarge, "value too large"),
+        (Error::SeqExhausted, "sequence numbers exhausted"),
+        (Error::WrongRecord, "descriptor does not match the record"),
+        (Error::UnknownRecord, "unknown record"),
+        (Error::NotOpen, "record not open"),
+        (Error::UnknownWatch, "unknown watch"),
+        (Error::Unavailable, "backend unavailable"),
+        (Error::Conflict, "concurrent write won"),
+        (Error::Decrypt, "decryption failed"),
+        (Error::Signer, "signing failed"),
+        (Error::Randomness, "randomness unavailable"),
+        (Error::Crypto, "cryptographic failure"),
+    ] {
+        assert_eq!(error.to_string(), message);
+        assert!(std::error::Error::source(&error).is_none());
+    }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn equivalent_authenticated_descriptor_retains_the_original_signature() {
+    block_on(async {
+        let owner = key(41);
+        let descriptor = Descriptor::create(&Schema::dflt(1).unwrap(), &owner).unwrap();
+        let mut alternate = descriptor.clone();
+        alternate.signature = owner.alternative_signature(&alternate.schema);
+        assert_ne!(descriptor.signature, alternate.signature);
+        alternate.validate(&TestVerifier).unwrap();
+        assert_eq!(descriptor.key(), alternate.key());
+        let backend = network();
+        backend.create(&descriptor).await.unwrap();
+        backend.create(&alternate).await.unwrap();
+        assert_eq!(
+            backend.descriptor(&descriptor.key()).await.unwrap(),
+            Some(descriptor)
+        );
+    });
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn independent_equal_sequence_encrypted_writes_compare_plaintext_and_keep_original_bytes() {
+    block_on(async {
+        let backend = network();
+        let owner = key(42);
+        let encryption = EncryptionKey::from_bytes([43; 32]);
+        let mut first = client(&backend);
+        let record = first
+            .create(&Schema::dflt(1).unwrap(), &owner)
+            .await
+            .unwrap();
+        let mut second = client(&backend);
+        let mut conflicting = client(&backend);
+        second.open(&record).await.unwrap();
+        conflicting.open(&record).await.unwrap();
+        first
+            .set(&record, 0, b"unchanged", &owner, Some(&encryption))
+            .await
+            .unwrap();
+        let original = backend.get(&record, 0).await.unwrap().unwrap();
+        assert_eq!(
+            second
+                .set(&record, 0, b"unchanged", &owner, Some(&encryption))
+                .await
+                .unwrap(),
+            WriteOutcome::Written { seq: 0 }
+        );
+        assert_eq!(
+            second.get_signed(&record, 0).await.unwrap(),
+            Some(original.clone())
+        );
+        assert!(second.state().queue().is_empty());
+        assert_eq!(
+            conflicting
+                .set(&record, 0, b"different", &owner, Some(&encryption))
+                .await
+                .unwrap(),
+            WriteOutcome::Stale { current_seq: 0 }
+        );
+        assert_eq!(
+            conflicting.get_signed(&record, 0).await.unwrap(),
+            Some(original.clone())
+        );
+        assert!(conflicting.state().queue().is_empty());
+        assert_eq!(backend.get(&record, 0).await.unwrap(), Some(original));
     });
 }

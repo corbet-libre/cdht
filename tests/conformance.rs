@@ -97,6 +97,38 @@ fn upstream_vectors() {
             cdht::rpc::ValueBytes::encode(&value).unwrap().as_bytes(),
             bytes(&vector["rpcValue"])
         );
+        let descriptor = Descriptor::create(&schema, &owner).unwrap();
+        for (request, response, expected) in [
+            (
+                bytes(&vectors["rpcOperation"]),
+                cdht::rpc::Response::Get {
+                    accepted: true,
+                    value: Some(Box::new(value.clone())),
+                    descriptor: Some(descriptor),
+                    peers: vec![],
+                },
+                "getAnswer",
+            ),
+            (
+                bytes(&vector["setQuestion"]),
+                cdht::rpc::Response::Set {
+                    accepted: false,
+                    need_descriptor: false,
+                    value: Some(Box::new(value.clone())),
+                    peers: vec![],
+                },
+                "setAnswer",
+            ),
+        ] {
+            let question =
+                cdht::rpc::SignedOperation::sign(request, &writer.public_key(), &owner).unwrap();
+            assert_eq!(
+                cdht::rpc::Answer::new(&question, &response)
+                    .unwrap()
+                    .as_bytes(),
+                bytes(&vector[expected])
+            );
+        }
         let decoded = SignedValue::from_blob(bytes(&vector["blob"]), value.signature).unwrap();
         decoded
             .validate(&record, &owner.public_key(), &schema, 1, &TestVerifier)
