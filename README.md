@@ -7,31 +7,29 @@ writers and subkeys, and every write is checked wherever it lands.
 
 ## Scope
 
-**Purpose.** Carry encrypted vault, device and offline-message records over either
-network backend using Veilid-compatible schemas, descriptors, signatures and VLD0.
+**Purpose.** Encrypted replicated records with Veilid-identical formats carry vault restore, device state, and offline messages over either network backend.
 
-**Owns.** Record validation, create/open/get/set/watch, an offline write queue,
-owner rehydration, bounded device-node storage and the Veilid replication rules.
-Application data stays opaque. All subkeys are available to the record owner.
+**Owns.**
+- Veilid-identical DFLT/SMPL schemas, descriptors, record keys, signed values, encrypted values, and VLD0 signatures; no re-signing, renumbering, or re-encryption in transit.
+- DHT client operations create, open, get, set, and watch, with an offline write queue and owner rehydration of existing signed values on open.
+- Node behavior while the app is in use with bounded per-node storage (128 records / 256 MB native, 64 records / 128 MB in browsers), least-recently-used eviction, no record expiry, writes to the 5 closest nodes, and reads requiring agreement of 3.
+- Restore from the passkey-derived locator, and per-device sync using signed logs, hybrid logical clocks, keep-both versions, and monotonic tombstones without a CRDT library.
 
-**Never.** Store operator records, impose record expiry, invent retention or
-consensus, interpret application sync or membership formats, retain signing keys,
-or perform socket I/O. Missing replicas never establish an empty vault.
-Domain libraries own per-device logs, clocks, keep-both and tombstones inside
-record contents; they compress and pad before Records encrypts.
+**Never.**
+- No record expiry, operator storage, volunteer mailboxes, always-on nodes, Tor-only formats, or invented keys, schemas, consensus, or retention rules.
+- No contact or group policy decisions; record owners decide which records and writers exist.
+- No secret-key custody and no network or socket code; signing, verification, and record encryption arrive through injected `Signer`, `Verifier`, and `RecordCipher` ports supplied by `ckmg`, transport arrives through `cmsh`, and production never depends on `veilid-core` directly.
+- No plaintext or cross-community replication, no restore guarantee without a surviving passkey and available replicas, and missing replicas are never treated as empty.
 
-**States and ports.** Queued → flushed writes; leased watches with explicit loss;
-Available / Unavailable reads. `Dht`, `Backend`, `Network`, and scoped `Signer`,
-`Verifier`, `RecordCipher` capabilities. Mesh carries original signed record RPC
-bytes. The device stores its own copy and serves other records while in use.
+**States.**
+- Per record, queued write to flushed; active watch to lost lease to refreshed; reads report Available or Unavailable, never empty from missing replicas; the device serves as a node while in use.
 
-**Invariants and tests.** Preserve original signatures and nonces; no secret-key
-export or operator record store. Upstream native/Wasm byte conformance, queue,
-watch, capacity/LRU, conflict and rehydration tests are required. Active-device-loss
-restore and Tor-to-Veilid import require real network evidence beyond format tests.
-See [CONTRACT](docs/CONTRACT.md), [CONFORMANCE](docs/CONFORMANCE.md) and
-[CHURN](docs/CHURN.md) for the exact incomplete production seams and failed churn
-acceptance evidence. No retention or complete restore claim is made here.
+**Test obligations.**
+- Upstream byte conformance on native and WebAssembly for schemas, keys, descriptors, signatures, ciphertext, and VLD0, with the upstream implementation as oracle.
+- Queued writes, watches, quorum reads and writes, capacity and eviction, and stale and conflicting records under upstream rules, including no local winner for equal-sequence conflicts, plus import of existing signed values across backends without conversion.
+- Device-loss restore with the same synced passkey on a new device recovers identity, memberships, contacts, and history without operator storage; loss of all device copies plus no recoverable replicas means equal loss for every passkey, and a network outage alone is not permanent loss.
+- Data is packed with `cprz` compression, then padding, then VLD0 encryption into as few records as possible so size reveals nothing; population churn is measured and reported honestly with evidence that no record lives on operator storage.
+- Common obligations: stable Rust for native and WebAssembly with identical vectors; explicit state machines with injected clock, randomness, storage, and network; full line and branch coverage with real round trips and injected delay, loss, cancellation, corruption, and conflicts; atomic publication with durable acceptance before acknowledgement and reconciliation of unknown outcomes; per-community isolation; bounded work with secrets omitted from errors; reused third-party cryptography; no personal identifiers in outbound requests.
 
 ## Records
 
