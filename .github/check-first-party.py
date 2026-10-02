@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Require main declarations and one resolved revision per first-party crate."""
 import re
+import os
 import subprocess
 import sys
 import tomllib
@@ -37,6 +38,12 @@ def check_manifest(value):
             check_manifest(item)
 
 
+def check_layout(paths):
+    # The resolver artifact cannot substitute for a committed input snapshot.
+    if 'Cargo.toml' in paths and 'Cargo.lock' not in paths:
+        raise ValueError('Root Cargo workspace requires a committed Cargo.lock')
+
+
 def rejects(function, value):
     try:
         function(value)
@@ -46,6 +53,10 @@ def rejects(function, value):
 
 
 def self_test():
+    check_layout(['Cargo.toml', 'Cargo.lock'])
+    check_layout([])
+    rejects(check_layout, ['Cargo.toml'])
+    rejects(check_layout, ['Cargo.toml', 'nested/Cargo.lock'])
     repo = 'https://github.com/corbet-foss/example'
     source = 'git+' + repo + '?branch=main#' + 'a' * 40
     package = {'name': 'example', 'source': source}
@@ -71,7 +82,16 @@ def self_test():
 if __name__ == '__main__':
     self_test()
     if '--self-test' not in sys.argv:
-        paths = subprocess.check_output(['git', 'ls-files', '-z'], text=True).split('\0')
+        if '--archive' in sys.argv:
+            # The executor has verified a committed source archive. It intentionally
+            # contains no .git directory; inspect its source files before resolution.
+            paths = []
+            for root, directories, files in os.walk('.'):
+                directories[:] = [d for d in directories if d not in ('.git', 'target')]
+                paths.extend(str(Path(root) / name) for name in files)
+        else:
+            paths = subprocess.check_output(['git', 'ls-files', '-z'], text=True).split('\0')
+        check_layout(paths)
         for name in paths:
             path = Path(name)
             if path.name == 'Cargo.toml':

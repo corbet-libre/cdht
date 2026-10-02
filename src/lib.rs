@@ -32,6 +32,7 @@ mod error;
 mod network;
 mod record;
 pub mod rpc;
+pub mod runtime;
 mod schema;
 
 pub use backend::{

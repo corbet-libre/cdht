@@ -1,0 +1,18 @@
+schema = 1
+project = "cdht"
+
+[checks.native]
+kind = "commands"
+commands = [["bash", "ci/native-check.sh"]]
+
+[checks.coverage]
+kind = "commands"
+commands = [["bash", "ci/coverage-check.sh"]]
+
+[checks.conformance]
+kind = "commands"
+commands = [["bash", "ci/veilid-vectors.sh"]]
+
+[checks.resolve]
+kind = "commands"
+commands = [["bash", "ci/resolve-check.sh"]]
