@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "Signed replicated records with Veilid DHT semantics"
 license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
-repository = "https://github.com/corbet-foss/cdht"
+repository = "https://git.corbet.ch/corbet-foss/cdht.git"
 readme = "README.md"
 publish = false
 include = [
@@ -23,9 +23,11 @@ include = [
 crate-type = ["rlib"]
 
 [dependencies]
+futures = "0.3"
 blake3 = "1.8"
 chacha20 = { version = "0.10", features = ["xchacha"] }
 capnp = "0.26.1"
+lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "safe-encode", "safe-decode"] }
 range-set-blaze = "0.6.0"
 getrandom = "0.4"
 zeroize = "1.8"
@@ -36,6 +38,7 @@ serde = { version = "1.0", features = ["derive"] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
+veilid-core-optimized = { git = "https://gitlab.com/veilid/veilid.git", branch = "main", default-features = false, features = ["enable-crypto-vld0"] }
 serde_json = "1.0"
 wasm-bindgen-test = "0.3"
 # Real maintained VLD0 signing and verification for independent fixtures.

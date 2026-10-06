@@ -38,6 +38,23 @@ fn upstream_vectors() {
         &TestVerifier,
     )
     .unwrap();
+    assert_eq!(vectors["importedEnvelope"], true);
+    let envelope = cdht::rpc::envelope::Envelope::verify(
+        bytes(&vectors["envelope"]),
+        &writer.public_key(),
+        100,
+        cdht::rpc::envelope::TimeWindow {
+            behind_us: 0,
+            ahead_us: 0,
+        },
+        &TestVerifier,
+    )
+    .unwrap();
+    assert_eq!(envelope.sender(), &owner.public_key());
+    assert_eq!(
+        &*envelope.open(&common::NodeCipher(2)).unwrap(),
+        &bytes(&vectors["rpcPacket"])
+    );
     for vector in vectors["schemas"].as_array().unwrap() {
         let compiled = bytes(&vector["schema"]);
         let schema = Schema::parse(&compiled).unwrap();

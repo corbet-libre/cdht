@@ -149,14 +149,74 @@ pub async fn generate() {
         owner.clone(),
         signature,
     );
+    // The original upstream node envelope remains separate from the inner
+    // watcher signer. Exercise both implementations with the same public seeds.
+    let core_crypto = vcrypto.crypto();
+    let envelope = crate::crypto::Envelope::try_new_env0(
+        &core_crypto,
+        CRYPTO_KIND_VLD0,
+        Timestamp::new(100),
+        Nonce::new(&[3; 24]),
+        core_crypto
+            .routing_table()
+            .generate_node_id(&owner)
+            .unwrap(),
+        core_crypto
+            .routing_table()
+            .generate_node_id(&writer)
+            .unwrap(),
+    )
+    .unwrap();
+    let envelope = envelope
+        .to_encrypted_data(
+            &core_crypto,
+            Bytes::copy_from_slice(&rpc_packet),
+            &owner_secret,
+            &None,
+        )
+        .await
+        .unwrap();
+    let imported: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(std::env::var("CDHT_IMPORT").unwrap()).unwrap())
+            .unwrap();
+    let imported = Bytes::from(
+        BASE64URL_NOPAD
+            .decode(imported["envelope"].as_str().unwrap().as_bytes())
+            .unwrap(),
+    );
+    let decoded =
+        crate::crypto::Envelope::try_from_signed_data(&core_crypto, imported.clone(), &None)
+            .await
+            .unwrap();
+    assert_eq!(
+        decoded.get_recipient_id(),
+        core_crypto
+            .routing_table()
+            .generate_node_id(&writer)
+            .unwrap()
+    );
+    assert_eq!(
+        decoded
+            .decrypt_body(&core_crypto, imported, &writer_secret, &None)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"original node envelope"
+    );
     let watches: Vec<_> = crate::rpc_processor::cdht_watch_vectors()
         .into_iter()
         .map(
             |(question, answer)| serde_json::json!({"question":b64(question),"answer":b64(answer)}),
         )
         .collect();
-    let output = serde_json::json!({"commit":"dd8e2cdd72b5bf817172ac31c20872b168c5c8fc",
-        "changeCancelled": b64(crate::rpc_processor::cdht_changed(None)), "watches":watches, "rpcOperation":b64(&operation_data), "rpcPacket":b64(&rpc_packet), "schemas":schema_vectors, "schema":b64(schema.compile()), "owner":b64(owner.ref_value()),
+    let inspections: Vec<_> = crate::rpc_processor::cdht_inspect_vectors()
+        .into_iter()
+        .map(
+            |(question, answer)| serde_json::json!({"question":b64(question),"answer":b64(answer)}),
+        )
+        .collect();
+    let output = serde_json::json!({"commit":"dd8e2cdd72b5bf817172ac31c20872b168c5c8fc", "inspections":inspections,
+        "envelope": b64(&envelope), "importedEnvelope": true, "changeCancelled": b64(crate::rpc_processor::cdht_changed(None)), "watches":watches, "rpcOperation":b64(&operation_data), "rpcPacket":b64(&rpc_packet), "schemas":schema_vectors, "schema":b64(schema.compile()), "owner":b64(owner.ref_value()),
         "writer":b64(writer.ref_value()), "full_key":full_key.to_string(), "values":values});
     std::fs::write(
         std::env::var("CDHT_VECTORS").unwrap(),

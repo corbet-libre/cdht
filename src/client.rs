@@ -33,6 +33,25 @@ pub enum WriteOutcome {
     },
 }
 
+/// Result of preparing an exact-sequence publication in the original client.
+/// Neither variant attests durable storage or network replication.
+pub enum QueuedPublication {
+    /// The original signed value is staged in [`ClientState`]. Persist that state
+    /// through the owner transaction before allowing [`Dht::flush`].
+    Queued,
+    /// An already authenticated local observation conflicts with the requested
+    /// generation. Its original signed value is returned unchanged; nothing was queued.
+    Conflict(SignedValue),
+}
+impl std::fmt::Debug for QueuedPublication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Queued => "QueuedPublication::Queued",
+            Self::Conflict(_) => "QueuedPublication::Conflict([redacted])",
+        })
+    }
+}
+
 /// Result of [`Dht::flush`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FlushReport {
@@ -125,7 +144,11 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
                     .is_ok()
             }) {
                 let value = match client.cached(&write.key, write.subkey) {
-                    Some(current) if current.seq >= write.value.seq => current.clone(),
+                    // A newer generation supersedes an old retry. An equal
+                    // generation can be a conflicting fresh observation; keep
+                    // the original pending bytes so flush can report that
+                    // conflict rather than acknowledge the observed value.
+                    Some(current) if current.seq > write.value.seq => current.clone(),
                     _ => write.value,
                 };
                 client.remember(&write.key, write.subkey, value.clone());
@@ -299,6 +322,48 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         Ok(self.cached(key, subkey).cloned())
     }
 
+    /// Read this subkey from the original backend without an offline cache
+    /// fallback. A returned value is authenticated and never below the client's
+    /// observed sequence floor. A missing response after a prior value is
+    /// unavailable, not evidence of deletion. This is an observation from the
+    /// backend, not a claim of global currentness or authoritative absence.
+    pub async fn get_signed_fresh(
+        &mut self,
+        key: &RecordKey,
+        subkey: u32,
+    ) -> Result<Option<SignedValue>, Error> {
+        let (owner, schema) = self.validated(key)?;
+        if schema.writer_of(&owner, subkey).is_none() {
+            return Err(Error::SubkeyOutOfRange);
+        }
+        let remote = match self.backend.get(key, subkey).await {
+            Err(Error::Unavailable | Error::UnknownRecord) => return Err(Error::Unavailable),
+            result => result?,
+        };
+        match remote {
+            Some(value) => {
+                value.validate(key, &owner, &schema, subkey, &self.verifier)?;
+                if self
+                    .cached(key, subkey)
+                    .is_some_and(|prior| prior.seq > value.seq)
+                {
+                    return Err(Error::Conflict);
+                }
+                // Keep the exact authenticated observation that is returned,
+                // including an equal-sequence remote winner. Do not acknowledge
+                // or replace any outstanding signed publication obligation.
+                self.state
+                    .values
+                    .entry(*key)
+                    .or_default()
+                    .insert(subkey, value.clone());
+                Ok(Some(value))
+            }
+            None if self.cached(key, subkey).is_some() => Err(Error::Unavailable),
+            None => Ok(None),
+        }
+    }
+
     fn cached(&self, key: &RecordKey, subkey: u32) -> Option<&SignedValue> {
         self.state
             .values
@@ -362,6 +427,46 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         Ok(seq)
     }
 
+    /// Prepare an exact semantic sequence for a compound checkpoint. The
+    /// caller supplies a generation, never a sequence inferred independently per
+    /// part. An equal-sequence identical plaintext reuses the original signed
+    /// bytes; a newer or different equal-sequence value is a conflict.
+    ///
+    /// This synchronous capability borrow performs no network I/O. Persist the
+    /// complete signed [`ClientState`] through the owner transaction before
+    /// flushing; a queued value is not durable merely because this call returned.
+    pub fn queue_republish(
+        &mut self,
+        key: &RecordKey,
+        subkey: u32,
+        seq: u32,
+        data: &[u8],
+        writer: &impl Signer,
+        encryption: Option<&dyn RecordCipher>,
+    ) -> Result<QueuedPublication, Error> {
+        let (owner, schema) = self.validated(key)?;
+        schema.check_write(&owner, subkey, &writer.public_key(), data.len())?;
+        if seq > crate::MAX_SEQ {
+            return Err(Error::SeqExhausted);
+        }
+        if let Some(current) = self.cached(key, subkey) {
+            if current.seq > seq
+                || (current.seq == seq && Self::decrypt(current, encryption)?.as_slice() != data)
+            {
+                return Ok(QueuedPublication::Conflict(current.clone()));
+            }
+            if current.seq == seq {
+                let original = current.clone();
+                self.queue_write(key, subkey, &original);
+                return Ok(QueuedPublication::Queued);
+            }
+        }
+        let value = Self::signed_sequence(&owner, subkey, seq, data, writer, encryption)?;
+        value.validate(key, &owner, &schema, subkey, &self.verifier)?;
+        self.queue_write(key, subkey, &value);
+        Ok(QueuedPublication::Queued)
+    }
+
     fn signed_write(
         &self,
         key: &RecordKey,
@@ -385,6 +490,17 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
                 .ok_or(Error::SeqExhausted)?,
             None => 0,
         };
+        Self::signed_sequence(&owner, subkey, seq, data, writer, encryption)
+    }
+
+    fn signed_sequence(
+        owner: &[u8; 32],
+        subkey: u32,
+        seq: u32,
+        data: &[u8],
+        writer: &impl Signer,
+        encryption: Option<&dyn RecordCipher>,
+    ) -> Result<SignedValue, Error> {
         let (payload, nonce) = match encryption {
             Some(encryption) => {
                 let mut nonce = [0; 24];
@@ -393,7 +509,7 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
             }
             None => (data.to_vec(), None),
         };
-        SignedValue::sign_with_nonce(&owner, subkey, seq, payload, nonce, writer)
+        SignedValue::sign_with_nonce(owner, subkey, seq, payload, nonce, writer)
     }
 
     async fn send(

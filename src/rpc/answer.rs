@@ -41,7 +41,7 @@ impl UnverifiedPeerInfoBytes {
         &self.0
     }
 }
-fn peers_encode(
+pub(super) fn peers_encode(
     peers: &[UnverifiedPeerInfoBytes],
     mut list: capnp::struct_list::Builder<'_, wire::peer_info::Owned>,
 ) -> Result<(), Error> {
@@ -58,7 +58,7 @@ fn peers_encode(
     }
     Ok(())
 }
-fn peers_decode(
+pub(super) fn peers_decode(
     list: capnp::struct_list::Reader<'_, wire::peer_info::Owned>,
 ) -> Result<Vec<UnverifiedPeerInfoBytes>, Error> {
     if list.len() as usize > MAX_PEERS {
@@ -113,7 +113,7 @@ pub enum Response {
 /// An original upstream answer Operation, correlated to an authenticated question.
 /// Construction encodes the handler's result; it never performs storage or
 /// manufactures an acknowledgment on behalf of a storage node.
-pub struct Answer(Vec<u8>);
+pub struct Answer(pub(super) Vec<u8>);
 impl Answer {
     /// Encode the matching GetValueA or SetValueA with the original request ID.
     pub fn new(question: &SignedOperation, response: &Response) -> Result<Self, Error> {

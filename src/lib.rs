@@ -28,16 +28,19 @@ mod veilid_capnp;
 mod backend;
 mod client;
 pub mod crypto;
+pub mod discovery;
 mod error;
 mod network;
 mod record;
 pub mod rpc;
+pub mod runtime;
 mod schema;
+pub mod watches;
 
 pub use backend::{
     Backend, Capacity, Change, LocalBackend, MAX_WATCH_MS, PUBLIC_WATCH_LIMIT, SetOutcome, WatchId,
 };
-pub use client::{ClientState, Dht, FlushReport, QueuedWrite, WriteOutcome};
+pub use client::{ClientState, Dht, FlushReport, QueuedPublication, QueuedWrite, WriteOutcome};
 pub use crypto::{EncryptionKey, RecordCipher, Signer, Verifier};
 pub use error::Error;
 pub use network::{

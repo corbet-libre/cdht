@@ -26,6 +26,8 @@ pub enum Error {
     NotOpen,
     /// The watch does not exist.
     UnknownWatch,
+    /// An authenticated node answered but declined a watch lease.
+    WatchRefused,
     /// The backend is unreachable (writes are queued).
     Unavailable,
     /// A concurrent write disagrees with the proposed value.
@@ -54,6 +56,7 @@ impl fmt::Display for Error {
             Error::UnknownRecord => "unknown record",
             Error::NotOpen => "record not open",
             Error::UnknownWatch => "unknown watch",
+            Error::WatchRefused => "watch refused",
             Error::Unavailable => "backend unavailable",
             Error::Conflict => "concurrent write won",
             Error::Decrypt => "decryption failed",

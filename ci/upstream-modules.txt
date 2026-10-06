@@ -1,7 +1,11 @@
 address
 answer
+crypto_info
+crypto_info_v_l_d0
 dial_info
+dial_info_detail
 node_id
+node_info
 node_status
 nonce
 opaque_record_key
@@ -34,6 +38,7 @@ peer_info
 private_route
 public_key
 question
+relay_info
 route_hop
 route_hop_data
 routed_operation

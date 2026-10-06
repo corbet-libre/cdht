@@ -1,7 +1,7 @@
 //! CI-only original Records bytes for an independent native Veilid store import.
 #[path = "../tests/common/mod.rs"]
 mod common;
-use cdht::{Dht, EncryptionKey, LocalBackend, Schema};
+use cdht::{Dht, EncryptionKey, LocalBackend, Schema, Signer};
 use common::{TestVerifier, key};
 use data_encoding::BASE64URL_NOPAD;
 fn main() {
@@ -22,6 +22,9 @@ fn main() {
     let value = &client.state().queue()[0].value;
     let descriptor = cdht::Descriptor::create(&Schema::dflt(1).unwrap(), &owner).unwrap();
     let output = serde_json::json!({
+        "envelope": BASE64URL_NOPAD.encode(cdht::rpc::envelope::Envelope::seal(
+            b"original node envelope", &key(2).public_key(), 100, &key(1), &common::NodeCipher(1)
+        ).unwrap()),
         "key": record.to_string(),
         "value": BASE64URL_NOPAD.encode(cdht::rpc::ValueBytes::encode(value).unwrap().as_bytes()),
         "descriptor": BASE64URL_NOPAD.encode(cdht::rpc::DescriptorBytes::encode(&descriptor).unwrap().as_bytes()),
