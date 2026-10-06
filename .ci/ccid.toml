@@ -1,0 +1,17 @@
+schema = 1
+project = "cdht"
+
+[checks.verify]
+kind = "commands"
+commands = [["bash", ".ci/verify.sh"]]
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["jq", "--version"], ["curl", "--version"], ["node", "--version"], ["python3", "--version"], ["git", "--version"], ["rustup", "run", "nightly", "rustc", "-vV"], ["rustup", "run", "nightly", "cargo", "llvm-cov", "--version"]]
+cache_outputs = ["coverage.json", "coverage.lcov", "coverage.txt", "dependency-metadata.json"]
+
+[render]
+tool_revision = "81ebac8e86e20bc93b69d5e912bbcb0c0d036d58"
+
+[jobs.verify]
+scheduler = "crow"
+checks = ["verify"]
+workflow = "repository-jobs"
+command = ["bash", ".ci/run-cached.sh"]
