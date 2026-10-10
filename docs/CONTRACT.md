@@ -14,6 +14,30 @@ scoped cipher opens them. The production path never exports the private root,
 raw signing keys or record cipher keys. Independent `EncryptionKey` codecs serve
 Veilid interoperability and are not a Keys export API.
 
+`queue_original` stages an already signed descriptor/value pair through original
+validation without a signer, cipher or network call. Original raw ValueData,
+ciphertext, nonce and signatures remain unchanged. The enclosing Vault still
+authorizes this exact publication; a valid record signature is not current
+member authority. Cached observations and outstanding same-slot obligations
+both fence the generation. Equal-sequence differences, including another valid
+signature or fresh encryption of the same plaintext, refuse without changing
+the original state. No nonidentical signed value can supersede an outstanding
+same-slot obligation, even at a higher generation; the original obligation must
+first be reconciled. Existing descriptor bytes must also match exactly.
+
+Persist the original `ClientState` through the authenticated owner transaction
+before `flush`; staging alone is never durable success. Reopening revalidates
+signed state while preserving the original queued obligation separately from
+newer cached observations. The enclosing owner must match its exact retained
+obligation against that restored queue. Repeated identical staging preserves
+the entire queued snapshot and ordering. Unknown network completion keeps the original
+bytes for reconciliation/retransmission, never new signing or encryption.
+Written owner scenarios cover original RPC bytes through queue, serde, reopen,
+offline flush, lost reply, cancellation, independent cached/queued conflicts and
+malformed inputs. They have not executed in this tranche. This staging API does
+not supply the unavailable native Veilid exact-import bridge or establish Tor,
+native/browser, distribution or complete creation/recovery readiness.
+
 Transport preserves original descriptor/value blobs, signatures, sequence numbers
 and nonces. An unchanged encrypted value retains its original ciphertext. The
 RPC codec uses unchanged upstream generated Cap'n Proto types and the original

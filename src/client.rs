@@ -143,20 +143,16 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
                     .validate(&write.key, &owner, &schema, write.subkey, &client.verifier)
                     .is_ok()
             }) {
-                let value = match client.cached(&write.key, write.subkey) {
-                    // A newer generation supersedes an old retry. An equal
-                    // generation can be a conflicting fresh observation; keep
-                    // the original pending bytes so flush can report that
-                    // conflict rather than acknowledge the observed value.
-                    Some(current) if current.seq > write.value.seq => current.clone(),
-                    _ => write.value,
-                };
-                client.remember(&write.key, write.subkey, value.clone());
+                // A cached observation is independent of the original signed
+                // publication obligation. Keep both: flush must reconcile the
+                // original bytes against a genuine backend outcome, including
+                // a higher or equal-conflicting remote value.
+                client.remember(&write.key, write.subkey, write.value.clone());
                 client
                     .state
                     .queue
                     .retain(|q| !(q.key == write.key && q.subkey == write.subkey));
-                client.state.queue.push(QueuedWrite { value, ..write });
+                client.state.queue.push(write);
             }
         }
         client
@@ -425,6 +421,62 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         let seq = value.seq;
         self.queue_write(key, subkey, &value);
         Ok(seq)
+    }
+
+    /// Stage already signed original descriptor/value bytes without a signer,
+    /// cipher or network I/O. The enclosing owner supplies and authorizes this
+    /// exact publication; signatures prove the record writer, not current member
+    /// authority. Persist the complete original [`ClientState`] before flush.
+    ///
+    /// All cryptographic and schema checks precede mutation. Both the cached
+    /// observation and an outstanding same-slot obligation fence the generation.
+    /// Equal-sequence cached byte/signature differences are conflicts, including
+    /// fresh encryption of the same plaintext. An outstanding obligation cannot
+    /// be superseded by any nonidentical signed value. Existing descriptors must be exact.
+    /// Refusal leaves every original descriptor, value and queue entry unchanged.
+    pub fn queue_original(
+        &mut self,
+        descriptor: &Descriptor,
+        subkey: u32,
+        value: &SignedValue,
+    ) -> Result<QueuedPublication, Error> {
+        let schema = descriptor.validate(&self.verifier)?;
+        let key = descriptor.key();
+        value.validate(&key, &descriptor.owner, &schema, subkey, &self.verifier)?;
+        if self
+            .state
+            .descriptors
+            .get(&key)
+            .is_some_and(|current| current != descriptor)
+        {
+            return Err(Error::Conflict);
+        }
+        let conflicts = |current: &SignedValue| {
+            current.seq > value.seq
+                || (current.seq == value.seq
+                    && (!current.same_value(value) || current.signature != value.signature))
+        };
+        if let Some(current) = self.cached(&key, subkey)
+            && conflicts(current)
+        {
+            return Ok(QueuedPublication::Conflict(current.clone()));
+        }
+        if let Some(pending) = self
+            .state
+            .queue
+            .iter()
+            .find(|queued| queued.key == key && queued.subkey == subkey)
+        {
+            if !pending.value.same_value(value) || pending.value.signature != value.signature {
+                return Ok(QueuedPublication::Conflict(pending.value.clone()));
+            }
+            // Exact idempotence preserves ordering and original blob bookkeeping
+            // as well as every signed byte; do not remove/reinsert this obligation.
+            return Ok(QueuedPublication::Queued);
+        }
+        self.state.descriptors.insert(key, descriptor.clone());
+        self.queue_write(&key, subkey, value);
+        Ok(QueuedPublication::Queued)
     }
 
     /// Prepare an exact semantic sequence for a compound checkpoint. The
