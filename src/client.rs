@@ -338,26 +338,42 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         };
         match remote {
             Some(value) => {
-                value.validate(key, &owner, &schema, subkey, &self.verifier)?;
-                if self
-                    .cached(key, subkey)
-                    .is_some_and(|prior| prior.seq > value.seq)
-                {
-                    return Err(Error::Conflict);
-                }
-                // Keep the exact authenticated observation that is returned,
-                // including an equal-sequence remote winner. Do not acknowledge
-                // or replace any outstanding signed publication obligation.
-                self.state
-                    .values
-                    .entry(*key)
-                    .or_default()
-                    .insert(subkey, value.clone());
+                self.observe_original(key, subkey, &value)?;
                 Ok(Some(value))
             }
             None if self.cached(key, subkey).is_some() => Err(Error::Unavailable),
             None => Ok(None),
         }
+    }
+
+    /// Retain an original signed observation without calling the network or
+    /// changing any pending publication. This applies the same validation and
+    /// observed sequence floor as [`Self::get_signed_fresh`]. A valid signature
+    /// is not proof of a recent read, holder agreement or current authority.
+    /// The enclosing owner must retain its actual read report independently.
+    ///
+    /// An equal-sequence different observation remains distinct from a queued
+    /// obligation. Invalid or lower-sequence input leaves all state unchanged.
+    pub fn observe_original(
+        &mut self,
+        key: &RecordKey,
+        subkey: u32,
+        value: &SignedValue,
+    ) -> Result<(), Error> {
+        let (owner, schema) = self.validated(key)?;
+        value.validate(key, &owner, &schema, subkey, &self.verifier)?;
+        if self
+            .cached(key, subkey)
+            .is_some_and(|prior| prior.seq > value.seq)
+        {
+            return Err(Error::Conflict);
+        }
+        self.state
+            .values
+            .entry(*key)
+            .or_default()
+            .insert(subkey, value.clone());
+        Ok(())
     }
 
     fn cached(&self, key: &RecordKey, subkey: u32) -> Option<&SignedValue> {

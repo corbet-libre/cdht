@@ -491,3 +491,64 @@ shared!(
         ));
     }
 );
+
+shared!(
+    original_observation_keeps_its_floor_and_never_replaces_the_pending_publication,
+    {
+        let backend = TransportFaults::new();
+        backend.inner.set_online(false);
+        let (descriptor, pending) = signed(0, PLAINTEXT, 62);
+        let mut client = Dht::new(backend.clone(), TestVerifier);
+        client.queue_original(&descriptor, 0, &pending).unwrap();
+        let original_queue = client.state().queue().to_vec();
+        let conflict = signed(0, b"equal conflicting observation", 63).1;
+        client
+            .observe_original(&descriptor.key(), 0, &conflict)
+            .unwrap();
+        assert_eq!(client.state().queue(), original_queue);
+        assert_eq!(*backend.writes.lock().unwrap(), 0);
+        assert_eq!(
+            client.get_signed(&descriptor.key(), 0).await.unwrap(),
+            Some(conflict)
+        );
+        let higher = signed(1, b"higher authenticated observation", 64).1;
+        client
+            .observe_original(&descriptor.key(), 0, &higher)
+            .unwrap();
+        let stored = snapshot(&client);
+        assert_eq!(client.state().queue(), original_queue);
+        assert_eq!(
+            client.observe_original(&descriptor.key(), 0, &pending),
+            Err(Error::Conflict)
+        );
+        assert_eq!(snapshot(&client), stored);
+        for case in 0..3 {
+            let mut invalid = higher.clone();
+            let subkey = if case == 2 { 1 } else { 0 };
+            if case == 0 {
+                invalid.signature[0] ^= 1;
+            }
+            if case == 1 {
+                invalid.writer = key(92).public_key();
+            }
+            assert!(
+                client
+                    .observe_original(&descriptor.key(), subkey, &invalid)
+                    .is_err()
+            );
+            assert_eq!(snapshot(&client), stored);
+        }
+        drop(client);
+        let restored: ClientState = serde_json::from_slice(&stored).unwrap();
+        let mut reopened = Dht::with_state(backend.clone(), TestVerifier, restored);
+        assert_eq!(snapshot(&reopened), stored);
+        let QueuedPublication::Conflict(observed) =
+            reopened.queue_original(&descriptor, 0, &pending).unwrap()
+        else {
+            panic!("retained signed observation lost its floor")
+        };
+        assert_eq!(observed, higher);
+        assert_eq!(reopened.state().queue(), original_queue);
+        assert_eq!(*backend.writes.lock().unwrap(), 0);
+    }
+);

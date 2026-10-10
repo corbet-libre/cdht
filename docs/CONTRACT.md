@@ -38,6 +38,14 @@ malformed inputs. They have not executed in this tranche. This staging API does
 not supply the unavailable native Veilid exact-import bridge or establish Tor,
 native/browser, distribution or complete creation/recovery readiness.
 
+`observe_original` records only a validated original signed observation and its
+sequence floor, preserving every pending publication unchanged. Invalid or older
+values refuse before mutation; equal-sequence conflicts remain independent cache
+observations. It performs no network call and cannot attest freshness, agreement
+or member authority. Owners using explicit network read reports must retain and
+check that original evidence separately; `Backend::get` may return a partial
+signed result and does not imply the original three-holder read target.
+
 Transport preserves original descriptor/value blobs, signatures, sequence numbers
 and nonces. An unchanged encrypted value retains its original ciphertext. The
 RPC codec uses unchanged upstream generated Cap'n Proto types and the original
