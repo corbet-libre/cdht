@@ -294,3 +294,80 @@ fn envelope_refuses_oversized_or_mismatched_capabilities_and_bounds_authenticate
         Err(cdht::Error::ValueTooLarge)
     ));
 }
+
+fn sealed(node: &common::TestKey, destination: &common::TestKey, at: u64) -> Vec<u8> {
+    Envelope::seal(
+        b"body",
+        &destination.public_key(),
+        at,
+        node,
+        &NodeCipher(94),
+    )
+    .unwrap()
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn replay_inside_the_time_window_is_refused_and_expiry_frees_the_entry() {
+    use cdht::{Error, rpc::envelope::ReplayCache};
+    let node = key(94);
+    let destination = key(95);
+    let dest = destination.public_key();
+    let bytes = sealed(&node, &destination, 100);
+    let mut cache = ReplayCache::new(8);
+    let verify = |bytes: &[u8], now: u64, cache: &mut ReplayCache| {
+        Envelope::verify_once(bytes.to_vec(), &dest, now, window(), &TestVerifier, cache)
+    };
+    assert!(verify(&bytes, 100, &mut cache).is_ok());
+    assert_eq!(cache.len(), 1);
+    // The same authenticated bytes inside the window, early and late.
+    assert!(matches!(
+        verify(&bytes, 100, &mut cache),
+        Err(Error::Replay)
+    ));
+    assert!(matches!(
+        verify(&bytes, 105, &mut cache),
+        Err(Error::Replay)
+    ));
+    // A fresh envelope (new random nonce) is accepted.
+    let fresh = sealed(&node, &destination, 100);
+    assert!(verify(&fresh, 101, &mut cache).is_ok());
+    // Past the window the old bytes fail the time check and the entries are pruned.
+    assert!(verify(&bytes, 106, &mut cache).is_err());
+    let later = sealed(&node, &destination, 200);
+    assert!(verify(&later, 200, &mut cache).is_ok());
+    assert_eq!(cache.len(), 1);
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn full_replay_cache_fails_closed_and_unauthenticated_bytes_are_not_remembered() {
+    use cdht::{Error, rpc::envelope::ReplayCache};
+    let node = key(94);
+    let destination = key(95);
+    let dest = destination.public_key();
+    let mut cache = ReplayCache::new(1);
+    let first = sealed(&node, &destination, 100);
+    let second = sealed(&node, &destination, 100);
+    assert!(Envelope::verify_once(first, &dest, 100, window(), &TestVerifier, &mut cache).is_ok());
+    assert!(matches!(
+        Envelope::verify_once(
+            second.clone(),
+            &dest,
+            100,
+            window(),
+            &TestVerifier,
+            &mut cache
+        ),
+        Err(Error::Unavailable)
+    ));
+    // A tampered envelope fails authentication and never reaches the cache.
+    let mut roomy = ReplayCache::new(4);
+    let mut tampered = second;
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    assert!(
+        Envelope::verify_once(tampered, &dest, 100, window(), &TestVerifier, &mut roomy).is_err()
+    );
+    assert!(roomy.is_empty());
+}

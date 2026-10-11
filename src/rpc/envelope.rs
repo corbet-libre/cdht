@@ -7,6 +7,7 @@
 //! Original VLD0 ENV0 node authentication, independent of an inner watcher signer.
 //! No network key or relay rewrite is supported by this Tor-only direct adapter.
 use crate::{Error, Signer, Verifier, crypto::PublicKey};
+use std::collections::{BTreeMap, BTreeSet};
 use zeroize::Zeroizing;
 
 const HEADER: usize = 0x6a;
@@ -42,6 +43,66 @@ pub struct TimeWindow {
     /// Maximum future timestamp skew. Zero disallows future timestamps.
     pub ahead_us: u64,
 }
+/// Default number of authenticated envelope nonces remembered at once.
+pub const DEFAULT_REPLAY_CAPACITY: usize = 65_536;
+
+/// Bounded in-memory memory of accepted envelope nonces. An entry lives exactly
+/// as long as its envelope could still pass the time window, so a replay inside
+/// the window is refused and nothing is kept longer. Nothing is persisted. When
+/// the cache is full of live entries it refuses new envelopes (fail closed)
+/// instead of evicting one, because eviction would reopen a replay.
+pub struct ReplayCache {
+    capacity: usize,
+    seen: BTreeMap<(PublicKey, [u8; 24]), u64>,
+    by_expiry: BTreeSet<(u64, PublicKey, [u8; 24])>,
+}
+
+impl ReplayCache {
+    /// Cache holding at most `capacity` live nonces.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            seen: BTreeMap::new(),
+            by_expiry: BTreeSet::new(),
+        }
+    }
+
+    /// Number of nonces currently remembered.
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// Whether no nonce is remembered.
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
+    fn admit(
+        &mut self,
+        sender: PublicKey,
+        nonce: [u8; 24],
+        expires_us: u64,
+        now_us: u64,
+    ) -> Result<(), Error> {
+        while let Some(&(expiry, node, seen_nonce)) = self.by_expiry.first() {
+            if expiry >= now_us {
+                break;
+            }
+            self.by_expiry.remove(&(expiry, node, seen_nonce));
+            self.seen.remove(&(node, seen_nonce));
+        }
+        if self.seen.contains_key(&(sender, nonce)) {
+            return Err(Error::Replay);
+        }
+        if self.seen.len() >= self.capacity {
+            return Err(Error::Unavailable);
+        }
+        self.seen.insert((sender, nonce), expires_us);
+        self.by_expiry.insert((expires_us, sender, nonce));
+        Ok(())
+    }
+}
+
 /// An original envelope whose node signature, destination and timestamp have been
 /// authenticated. Inner record/watcher signatures still require separate checks.
 pub struct Envelope {
@@ -117,6 +178,27 @@ impl Envelope {
         let signature = signer.sign(&out[..end])?;
         out[end..].copy_from_slice(&signature);
         Ok(out)
+    }
+    /// Like [`Envelope::verify`], and additionally refuse an envelope whose
+    /// sender and nonce were already accepted inside the time window. The nonce
+    /// is remembered only after the node signature verified, so unauthenticated
+    /// traffic cannot fill the cache.
+    pub fn verify_once(
+        bytes: Vec<u8>,
+        destination: &PublicKey,
+        now_us: u64,
+        window: TimeWindow,
+        verifier: &impl Verifier,
+        cache: &mut ReplayCache,
+    ) -> Result<Self, Error> {
+        let envelope = Self::verify(bytes, destination, now_us, window, verifier)?;
+        cache.admit(
+            envelope.sender,
+            envelope.nonce,
+            envelope.timestamp_us.saturating_add(window.behind_us),
+            now_us,
+        )?;
+        Ok(envelope)
     }
     /// Authenticate original bytes before decrypting or allocating decompressed
     /// content. A valid inner watcher signature cannot substitute for this node.

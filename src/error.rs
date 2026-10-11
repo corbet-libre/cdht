@@ -34,6 +34,8 @@ pub enum Error {
     Conflict,
     /// Encrypted data did not decrypt (wrong key or modified).
     Decrypt,
+    /// An authenticated envelope was already accepted inside its time window.
+    Replay,
     /// Signing failed in the signer port.
     Signer,
     /// The platform random number generator failed.
@@ -60,6 +62,7 @@ impl fmt::Display for Error {
             Error::Unavailable => "backend unavailable",
             Error::Conflict => "concurrent write won",
             Error::Decrypt => "decryption failed",
+            Error::Replay => "envelope replayed",
             Error::Signer => "signing failed",
             Error::Randomness => "randomness unavailable",
             Error::Crypto => "cryptographic failure",
