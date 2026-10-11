@@ -292,6 +292,24 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         }
     }
 
+    /// Borrow all signed values retained by this validated original client.
+    /// This performs no network read and proves no freshness or consensus.
+    /// Values may still be queued publication intent; consumers must preserve
+    /// that distinction using the original queue before treating them as floors.
+    pub fn observations(&self) -> impl Iterator<Item = (&Descriptor, u32, &SignedValue)> {
+        self.state.descriptors.iter().flat_map(|(key, descriptor)| {
+            self.state
+                .values
+                .get(key)
+                .into_iter()
+                .flat_map(move |values| {
+                    values
+                        .iter()
+                        .map(move |(subkey, value)| (descriptor, *subkey, value))
+                })
+        })
+    }
+
     /// Borrow only an already validated signed observation from this client.
     /// This performs no network read and establishes no freshness or agreement.
     /// It lets the enclosing owner preserve its existing sequence floors while

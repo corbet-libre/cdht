@@ -654,6 +654,12 @@ shared!(
             Some(&newer)
         );
         assert_eq!(
+            client.observations().collect::<Vec<_>>(),
+            vec![(&descriptor, 0, &newer), (&descriptor, 1, &values[1])]
+        );
+        // Iteration is observational: the unflushed second value stays queued.
+        assert_eq!(client.state().queue().len(), 1);
+        assert_eq!(
             client.observed_value(&descriptor.key(), 1).unwrap(),
             Some(&values[1])
         );
