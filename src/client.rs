@@ -596,6 +596,18 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
     }
 
     fn queue_write(&mut self, key: &RecordKey, subkey: u32, value: &SignedValue) {
+        // Retrying an identical signed obligation must preserve its original
+        // position (including the retained upstream blob). Cancellation and an
+        // unknown reply cannot move it behind later dependent publications.
+        if self
+            .state
+            .queue
+            .iter()
+            .any(|queued| queued.key == *key && queued.subkey == subkey && &queued.value == value)
+        {
+            self.remember(key, subkey, value.clone());
+            return;
+        }
         self.state
             .queue
             .retain(|q| !(q.key == *key && q.subkey == subkey));
