@@ -650,9 +650,24 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
 
     /// Send queued writes in order until the backend is unreachable again.
     pub async fn flush(&mut self) -> Result<FlushReport, Error> {
+        self.flush_bounded(usize::MAX).await
+    }
+
+    /// Attempt at most the oldest queued write. Return before awaiting another
+    /// output so the owning durable transaction can retain the exact validated
+    /// outcome and sequence floors between writes. This is a transport report,
+    /// never a persistence receipt or application acknowledgment.
+    pub async fn flush_one(&mut self) -> Result<FlushReport, Error> {
+        self.flush_bounded(1).await
+    }
+
+    async fn flush_bounded(&mut self, maximum: usize) -> Result<FlushReport, Error> {
         let mut report = FlushReport::default();
         // Leave each queued write in place until its validated acknowledgment arrives.
         while let Some(write) = self.state.queue.first().cloned() {
+            if report.written + report.stale.len() >= maximum {
+                break;
+            }
             let descriptor = self
                 .state
                 .descriptors

@@ -552,3 +552,155 @@ shared!(
         assert_eq!(*backend.writes.lock().unwrap(), 0);
     }
 );
+
+fn two_original_outputs() -> (Descriptor, [SignedValue; 2]) {
+    let owner = key(93);
+    let descriptor = Descriptor::create(&Schema::dflt(2).unwrap(), &owner).unwrap();
+    let values = [0, 1].map(|subkey| {
+        let nonce = [101 + subkey as u8; 24];
+        let packed = EncryptionKey::from_bytes([55; 32])
+            .crypt(&nonce, &[subkey as u8, 7, 8])
+            .unwrap();
+        SignedValue::sign_with_nonce(
+            &descriptor.owner,
+            subkey,
+            2,
+            packed.to_vec(),
+            Some(nonce),
+            &owner,
+        )
+        .unwrap()
+    });
+    (descriptor, values)
+}
+
+shared!(one_output_flush_returns_before_the_next_original_write, {
+    let backend = TransportFaults::new();
+    let (descriptor, values) = two_original_outputs();
+    let mut client = Dht::new(backend.clone(), TestVerifier);
+    for (subkey, value) in values.iter().enumerate() {
+        client
+            .queue_original(&descriptor, subkey as u32, value)
+            .unwrap();
+    }
+    let report = client.flush_one().await.unwrap();
+    assert_eq!((report.written, report.remaining), (1, 1));
+    assert!(report.stale.is_empty());
+    assert_eq!(*backend.writes.lock().unwrap(), 1);
+    assert_eq!(
+        backend.inner.get(&descriptor.key(), 0).await.unwrap(),
+        Some(values[0].clone())
+    );
+    assert!(
+        backend
+            .inner
+            .get(&descriptor.key(), 1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let state: ClientState = serde_json::from_slice(&snapshot(&client)).unwrap();
+    let mut reopened = Dht::with_state(backend.clone(), TestVerifier, state.clone());
+    assert_eq!(reopened.state(), &state);
+    let report = reopened.flush_one().await.unwrap();
+    assert_eq!((report.written, report.remaining), (1, 0));
+    assert_eq!(*backend.writes.lock().unwrap(), 2);
+    assert_eq!(
+        backend.inner.get(&descriptor.key(), 1).await.unwrap(),
+        Some(values[1].clone())
+    );
+});
+
+shared!(
+    one_output_flush_retains_real_newer_floor_before_attempting_next_subkey,
+    {
+        let backend = TransportFaults::new();
+        let (descriptor, values) = two_original_outputs();
+        let newer = SignedValue::sign_with_nonce(
+            &descriptor.owner,
+            0,
+            3,
+            b"newer authenticated ciphertext".to_vec(),
+            Some([104; 24]),
+            &key(93),
+        )
+        .unwrap();
+        backend.inner.create(&descriptor).await.unwrap();
+        backend
+            .inner
+            .set(&descriptor.key(), 0, &newer)
+            .await
+            .unwrap();
+        let mut client = Dht::new(backend.clone(), TestVerifier);
+        for (subkey, value) in values.iter().enumerate() {
+            client
+                .queue_original(&descriptor, subkey as u32, value)
+                .unwrap();
+        }
+        let report = client.flush_one().await.unwrap();
+        assert_eq!((report.written, report.remaining), (0, 1));
+        assert_eq!(report.stale, vec![(descriptor.key(), 0)]);
+        assert_eq!(*backend.writes.lock().unwrap(), 1);
+        assert!(
+            backend
+                .inner
+                .get(&descriptor.key(), 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let state: ClientState = serde_json::from_slice(&snapshot(&client)).unwrap();
+        let mut reopened = Dht::with_state(backend, TestVerifier, state.clone());
+        assert_eq!(reopened.state(), &state);
+        assert!(
+            matches!(reopened.queue_original(&descriptor, 0, &values[0]).unwrap(), QueuedPublication::Conflict(value) if value == newer)
+        );
+        assert_eq!(reopened.state().queue().len(), 1);
+    }
+);
+
+shared!(
+    one_output_flush_unknown_and_cancelled_reply_keeps_exact_original_tail,
+    {
+        for mode in [1, 2] {
+            let backend = TransportFaults::new();
+            let (descriptor, values) = two_original_outputs();
+            let mut client = Dht::new(backend.clone(), TestVerifier);
+            for (subkey, value) in values.iter().enumerate() {
+                client
+                    .queue_original(&descriptor, subkey as u32, value)
+                    .unwrap();
+            }
+            let before = snapshot(&client);
+            *backend.mode.lock().unwrap() = mode;
+            if mode == 1 {
+                assert_eq!(client.flush_one().await.unwrap().remaining, 2);
+            } else {
+                assert!(client.flush_one().now_or_never().is_none());
+            }
+            assert_eq!(*backend.writes.lock().unwrap(), 1);
+            assert_eq!(snapshot(&client), before);
+            assert!(
+                backend
+                    .inner
+                    .get(&descriptor.key(), 1)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            *backend.mode.lock().unwrap() = 0;
+            let state: ClientState = serde_json::from_slice(&before).unwrap();
+            let mut reopened = Dht::with_state(backend.clone(), TestVerifier, state);
+            assert_eq!(reopened.flush_one().await.unwrap().remaining, 1);
+            assert_eq!(*backend.writes.lock().unwrap(), 2);
+            assert!(
+                backend
+                    .inner
+                    .get(&descriptor.key(), 1)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+);
