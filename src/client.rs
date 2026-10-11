@@ -292,6 +292,22 @@ impl<B: Backend, V: Verifier> Dht<B, V> {
         }
     }
 
+    /// Borrow only an already validated signed observation from this client.
+    /// This performs no network read and establishes no freshness or agreement.
+    /// It lets the enclosing owner preserve its existing sequence floors while
+    /// constructing a fresh original Records reader.
+    pub fn observed_value(
+        &self,
+        key: &RecordKey,
+        subkey: u32,
+    ) -> Result<Option<&SignedValue>, Error> {
+        let (owner, schema) = self.validated(key)?;
+        if schema.writer_of(&owner, subkey).is_none() {
+            return Err(Error::SubkeyOutOfRange);
+        }
+        Ok(self.cached(key, subkey))
+    }
+
     /// Read a subkey's signed value (see [`Dht::get`]).
     pub async fn get_signed(
         &mut self,

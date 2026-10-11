@@ -649,6 +649,18 @@ shared!(
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(
+            client.observed_value(&descriptor.key(), 0).unwrap(),
+            Some(&newer)
+        );
+        assert_eq!(
+            client.observed_value(&descriptor.key(), 1).unwrap(),
+            Some(&values[1])
+        );
+        assert!(matches!(
+            client.observed_value(&descriptor.key(), 2),
+            Err(Error::SubkeyOutOfRange)
+        ));
         let state: ClientState = serde_json::from_slice(&snapshot(&client)).unwrap();
         let mut reopened = Dht::with_state(backend, TestVerifier, state.clone());
         assert_eq!(reopened.state(), &state);
