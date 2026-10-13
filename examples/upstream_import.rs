@@ -22,7 +22,7 @@ fn main() {
     let value = &client.state().queue()[0].value;
     let descriptor = cdht::Descriptor::create(&Schema::dflt(1).unwrap(), &owner).unwrap();
     let output = serde_json::json!({
-        "envelope": BASE64URL_NOPAD.encode(cdht::rpc::envelope::Envelope::seal(
+        "envelope": BASE64URL_NOPAD.encode(&cdht::rpc::envelope::Envelope::seal(
             b"original node envelope", &key(2).public_key(), 100, &key(1), &common::NodeCipher(1)
         ).unwrap()),
         "key": record.to_string(),
