@@ -35,7 +35,7 @@ impl ChangeHint {
     }
 }
 /// Original upstream Operation containing one ValueChanged statement.
-pub struct Statement(Vec<u8>);
+pub struct Statement(pub(super) Vec<u8>);
 impl Statement {
     /// Encode a bounded change hint with a random operation identifier.
     pub fn value_changed(hint: &ChangeHint) -> Result<Self, Error> {

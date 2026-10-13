@@ -52,6 +52,8 @@ pub struct SimNetwork {
     corrupt_values: Arc<std::sync::atomic::AtomicBool>,
     corrupt_changes: Arc<std::sync::atomic::AtomicU8>,
     replayed_set_value: Arc<Mutex<Option<Vec<u8>>>>,
+    discovered: Arc<std::sync::atomic::AtomicUsize>,
+    watch_requests: Arc<Mutex<Vec<NodeId>>>,
 }
 impl SimNetwork {
     pub fn new(population: usize, capacity: Capacity) -> Self {
@@ -74,12 +76,43 @@ impl SimNetwork {
             corrupt_values: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             corrupt_changes: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             replayed_set_value: Arc::new(Mutex::new(None)),
+            discovered: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+            watch_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
     pub fn for_node(&self, index: usize) -> Self {
         let mut network = self.clone();
         network.local = Some(self.id(index));
         network
+    }
+    /// Restrict the initial topology; each real RPC response introduces the next
+    /// node. This models transport discovery only, never record ACKs or storage.
+    pub fn discover_progressively(&self) {
+        self.discovered
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn learn_from(&self, node: &NodeId) {
+        if let Some(index) = self
+            .nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|n| n.id == *node)
+        {
+            self.discovered
+                .fetch_max(index + 2, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn candidates(&self) -> Vec<NodeId> {
+        let count = self.discovered.load(std::sync::atomic::Ordering::Relaxed);
+        self.nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .take(count)
+            .filter(|n| n.online && self.local != Some(n.id))
+            .map(|n| n.id)
+            .collect()
     }
     pub fn online(&self, index: usize, online: bool) {
         self.nodes.lock().unwrap()[index].online = online;
@@ -116,6 +149,9 @@ impl SimNetwork {
     /// Delay only the reply after the actual node has allocated its lease.
     pub fn pause_watch_replies(&self, paused: bool) {
         self.watch_gate.pause(paused);
+    }
+    pub fn take_watch_requests(&self) -> Vec<NodeId> {
+        std::mem::take(&mut *self.watch_requests.lock().unwrap())
     }
     pub fn pause_get_replies(&self, paused: bool) {
         self.get_gate.pause(paused);
@@ -156,14 +192,16 @@ impl Network for SimNetwork {
         self.clock.load(std::sync::atomic::Ordering::Relaxed)
     }
     async fn closest(&self, _: &RecordKey) -> Result<Vec<NodeId>, Error> {
-        Ok(self
-            .nodes
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|n| n.online && self.local != Some(n.id))
-            .map(|n| n.id)
-            .collect())
+        Ok(self.candidates())
+    }
+    fn hints(&self, key: &RecordKey) -> Result<Vec<NodeId>, Error> {
+        if self.discovered.load(std::sync::atomic::Ordering::Relaxed) == usize::MAX {
+            return Ok(Vec::new());
+        }
+        let mut nodes = self.candidates();
+        nodes.sort_unstable_by_key(|node| std::array::from_fn::<_, 32, _>(|i| node[i] ^ key.0[i]));
+        nodes.truncate(cdht::MAX_FANOUT_NODES);
+        Ok(nodes)
     }
     async fn descriptor(
         &self,
@@ -171,6 +209,7 @@ impl Network for SimNetwork {
         key: &RecordKey,
     ) -> Result<Option<Descriptor>, Error> {
         let mut result = self.node(node)?.descriptor(key).await?;
+        self.learn_from(node);
         if self
             .corrupt_descriptors
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -201,6 +240,7 @@ impl Network for SimNetwork {
             value.signature[0] ^= 1;
         }
         self.get_gate.wait().await;
+        self.learn_from(node);
         Ok(result)
     }
     async fn set(
@@ -222,6 +262,7 @@ impl Network for SimNetwork {
         let store = self.node(node)?;
         store.create(descriptor).await?;
         let mut result = store.set(&descriptor.key(), subkey, value).await?;
+        self.learn_from(node);
         if let Some(bytes) = self.replayed_set_value.lock().unwrap().clone() {
             return Ok(SetOutcome::Newer(
                 cdht::rpc::ValueBytes::from_bytes(bytes)?.decode()?,
@@ -237,6 +278,7 @@ impl Network for SimNetwork {
         Ok(result)
     }
     async fn watch(&self, node: &NodeId, key: &RecordKey) -> Result<WatchId, Error> {
+        self.watch_requests.lock().unwrap().push(*node);
         let result = self.node(node)?.watch(key).await;
         self.watch_gate.wait().await;
         result

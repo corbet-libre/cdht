@@ -81,8 +81,33 @@ pub(crate) fn cdht_watch_vectors() -> Vec<(Vec<u8>,Vec<u8>)> {
         let mut answer = capnp::message::Builder::new_default();
         let mut operation = answer.init_root::<crate::veilid_capnp::operation::Builder>();
         operation.set_op_id(7);
-        RPCOperationWatchValueA::new(true, TimestampDuration::new(5_000_000),vec![],7).unwrap()
+        let granted_duration = if count == 0 { 0 } else { 5_000_000 };
+        RPCOperationWatchValueA::new(true, TimestampDuration::new(granted_duration),vec![],7).unwrap()
             .encode(&mut operation.get_kind().init_answer().get_detail().init_watch_value_a()).unwrap();
+        result.push((cdht_rpc_bytes(question),cdht_rpc_bytes(answer)));
+    }
+    result
+}
+
+pub(crate) fn cdht_inspect_vectors() -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut result = Vec::new();
+    for (subkeys, seqs) in [
+        (ValueSubkeyRangeSet::new(), vec![0, u32::MAX]),
+        (ValueSubkeyRangeSet::single_range(2,4), vec![1,2,u32::MAX]),
+        (ValueSubkeyRangeSet::full(), vec![u32::MAX; DHTSchema::MAX_SUBKEY_COUNT]),
+    ] {
+        let mut question = capnp::message::Builder::new_default();
+        let mut operation = question.init_root::<crate::veilid_capnp::operation::Builder>();
+        operation.set_op_id(7);
+        let mut q = operation.get_kind().init_question();
+        q.reborrow().get_respond_to().set_sender(());
+        RPCOperationInspectValueQ::new(OpaqueRecordKey::new(CRYPTO_KIND_VLD0, BareOpaqueRecordKey::new(&[9;32])), subkeys, true).unwrap()
+            .encode(&mut q.get_detail().init_inspect_value_q()).unwrap();
+        let mut answer = capnp::message::Builder::new_default();
+        let mut operation = answer.init_root::<crate::veilid_capnp::operation::Builder>();
+        operation.set_op_id(7);
+        RPCOperationInspectValueA::new(true, seqs.into_iter().map(ValueSeqNum::from).collect(), vec![], None).unwrap()
+            .encode(&mut operation.get_kind().init_answer().get_detail().init_inspect_value_a()).unwrap();
         result.push((cdht_rpc_bytes(question),cdht_rpc_bytes(answer)));
     }
     result
@@ -135,4 +160,4 @@ cd "$cdht_root"
 unset CARGO_TARGET_DIR
 cargo test --locked --test conformance -- --ignored --nocapture
 
-cargo test --locked --lib upstream_watch_vectors -- --ignored --nocapture
+cargo test --locked --lib upstream_ -- --ignored --nocapture

@@ -25,10 +25,12 @@ Available / Unavailable reads. `Dht`, `Backend`, `Network`, and scoped `Signer`,
 `Verifier`, `RecordCipher` capabilities. Mesh carries original signed record RPC
 bytes. The device stores its own copy and serves other records while in use.
 
-**Invariants and tests.** Preserve original signatures and nonces; no secret-key
+**Invariants and tests.** Forward stored signed bytes unchanged. Owner switches
+preserve the original full key, schema, sequence and decrypted content; fresh
+nonce/ciphertext/signature are expected; no secret-key
 export or operator record store. Upstream native/Wasm byte conformance, queue,
 watch, capacity/LRU, conflict and rehydration tests are required. Active-device-loss
-restore and Tor-to-Veilid import require real network evidence beyond format tests.
+restore and Tor-to-Veilid owner republication require real network evidence beyond format tests.
 See [CONTRACT](docs/CONTRACT.md), [CONFORMANCE](docs/CONFORMANCE.md) and
 [CHURN](docs/CHURN.md) for the exact incomplete production seams and failed churn
 acceptance evidence. No retention or complete restore claim is made here.
@@ -52,7 +54,9 @@ Value signatures use Veilid's legacy owner/subkey/sequence/data input for clear
 records, and its unpacked Cap'n Proto blob input for encrypted records. Record
 encryption is XChaCha20 with a separate signed nonce, without an AEAD tag. Wrong
 read keys produce garbage; application formats must detect unusable plaintext.
-No adapter may re-sign, renumber or re-encrypt a stored value during transport.
+Forwarding must not re-sign, renumber or re-encrypt a stored value. Explicit owner
+republication on a different native engine is a new encryption of the same semantic
+value, retaining the original full read key and sequence.
 See [CONFORMANCE](docs/CONFORMANCE.md) for the source inventory and deviations.
 
 ## Client
@@ -62,6 +66,21 @@ See [CONFORMANCE](docs/CONFORMANCE.md) for the source inventory and deviations.
 to the same subkey supersedes a queued one; stale queued writes are reported); persisted
 state (`ClientState`, no secrets) is re-validated on resume; nothing a backend returns is
 trusted.
+
+## Authenticated native runtime
+
+`runtime::Record<B>` is the whole-record facade for maintained native engines.
+The in-process Veilid core is part of the signature-verification trust boundary;
+Records still checks canonical key/schema, writer, sequence and size on every value.
+Only Mesh supplies this actual-core adapter. It is never an unsigned network port.
+The runtime owns encryption, persistence, fanout, watches and the sole offline queue.
+`Publication` distinguishes local queuing, native flush and authenticated conflicts.
+
+`prepare_republish` verifies an original Tor SignedValue then decrypts synchronously
+under the key owner's borrowed RecordCipher. The returned zeroizing content can be
+republished after that borrowed scope ends. Only that capability's own writer may
+republish. Native network, switch/restore and strict coverage remain qualification
+gates; these APIs do not prove public retention or passkey recovery by themselves.
 
 ## Backends and network port
 

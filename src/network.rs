@@ -10,6 +10,8 @@ use std::{
     future::Future,
     sync::Mutex,
 };
+#[path = "network_watches.rs"]
+mod watch_state;
 
 /// VLD0 node coordinate used for closest-node selection.
 pub type NodeId = [u8; 32];
@@ -32,6 +34,12 @@ pub trait Network {
     fn now_ms(&self) -> u64;
     /// Discover candidate storage nodes. Duplicates never count towards agreement.
     fn closest(&self, key: &RecordKey) -> impl Future<Output = Result<Vec<NodeId>, Error>>;
+    /// Authenticated storage-node hints learned since discovery, ordered and
+    /// bounded to `MAX_FANOUT_NODES`. These are candidates, never agreement votes.
+    /// The default supplies no additional knowledge for transports without hints.
+    fn hints(&self, _key: &RecordKey) -> Result<Vec<NodeId>, Error> {
+        Ok(Vec::new())
+    }
     /// Fetch an owner-signed descriptor from one node.
     fn descriptor(
         &self,
@@ -56,6 +64,7 @@ pub trait Network {
         value: &SignedValue,
     ) -> impl Future<Output = Result<SetOutcome, Error>>;
     /// Subscribe on one storage node. The adapter maintains the bounded lease.
+    /// An authenticated refusal is `WatchRefused`; silence is `Unavailable`.
     fn watch(&self, node: &NodeId, key: &RecordKey)
     -> impl Future<Output = Result<WatchId, Error>>;
     /// Cancel that node's subscription.
@@ -90,10 +99,18 @@ impl ReadReport {
     }
 }
 
-struct RemoteWatch {
+#[derive(Clone)]
+struct RemoteLease {
     node: NodeId,
     remote: WatchId,
+}
+struct RemoteWatch {
     key: RecordKey,
+    nodes: Vec<RemoteLease>,
+    pending: BTreeMap<u32, Change>,
+    reported: BTreeMap<u32, u32>,
+    next_reconcile_ms: u64,
+    abandoned: bool,
 }
 
 /// Record replication over a caller-owned network port. Own records remain in
@@ -104,6 +121,7 @@ pub struct NetworkBackend<N: Network, V: Verifier> {
     descriptors: Mutex<BTreeMap<RecordKey, Descriptor>>,
     watches: Mutex<BTreeMap<WatchId, RemoteWatch>>,
     next_watch: Mutex<u64>,
+    watch_operation: futures::lock::Mutex<()>,
     rechecked: Mutex<BTreeMap<(RecordKey, u32), (u64, u32)>>,
 }
 
@@ -116,6 +134,7 @@ impl<N: Network, V: Verifier> NetworkBackend<N, V> {
             descriptors: Mutex::new(BTreeMap::new()),
             watches: Mutex::new(BTreeMap::new()),
             next_watch: Mutex::new(1),
+            watch_operation: futures::lock::Mutex::new(()),
             rechecked: Mutex::new(BTreeMap::new()),
         }
     }
@@ -140,6 +159,36 @@ impl<N: Network, V: Verifier> NetworkBackend<N, V> {
             return Err(Error::Unavailable);
         }
         Ok(nodes)
+    }
+
+    // Original fanout_queue.rs rule: independently validated new nodes enter
+    // the same distance-ordered queue; a node is dispatched once per fanout.
+    // This bounded sequential port still does not claim core's lane scheduling.
+    fn next_peer(
+        &self,
+        key: &RecordKey,
+        pending: &mut Vec<NodeId>,
+        visited: &mut BTreeSet<NodeId>,
+    ) -> Result<Option<NodeId>, Error> {
+        if visited.len() == MAX_FANOUT_NODES {
+            return Ok(None);
+        }
+        let hints = self.network.hints(key)?;
+        if hints.len() > MAX_FANOUT_NODES {
+            return Err(Error::Encoding);
+        }
+        pending.extend(hints);
+        pending
+            .sort_unstable_by_key(|node| std::array::from_fn::<_, 32, _>(|i| node[i] ^ key.0[i]));
+        pending.dedup();
+        pending.retain(|node| !visited.contains(node));
+        pending.truncate(MAX_FANOUT_NODES);
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let node = pending.remove(0);
+        visited.insert(node);
+        Ok(Some(node))
     }
 
     fn cached_descriptor(&self, key: &RecordKey) -> Result<Descriptor, Error> {
@@ -174,7 +223,9 @@ impl<N: Network, V: Verifier> NetworkBackend<N, V> {
             contacted: 0,
         };
         let mut reachable = 0;
-        for node in self.peers(key).await? {
+        let mut pending = self.peers(key).await?;
+        let mut visited = BTreeSet::new();
+        while let Some(node) = self.next_peer(key, &mut pending, &mut visited)? {
             report.contacted += 1;
             let Ok(response) = self.network.get(&node, key, subkey).await else {
                 continue;
@@ -224,7 +275,9 @@ impl<N: Network, V: Verifier> Backend for NetworkBackend<N, V> {
             return Ok(Some(descriptor));
         }
         let mut reachable = false;
-        for node in self.peers(key).await? {
+        let mut pending = self.peers(key).await?;
+        let mut visited = BTreeSet::new();
+        while let Some(node) = self.next_peer(key, &mut pending, &mut visited)? {
             match self.network.descriptor(&node, key).await {
                 Ok(Some(descriptor)) => {
                     if descriptor.validate_for(key, &self.verifier).is_ok() {
@@ -263,10 +316,12 @@ impl<N: Network, V: Verifier> Backend for NetworkBackend<N, V> {
         for _ in 0..MAX_FANOUT_NODES {
             let mut agreement = 0;
             let mut restart = false;
-            for node in &peers {
+            let mut pending = peers.clone();
+            let mut visited = BTreeSet::new();
+            while let Some(node) = self.next_peer(key, &mut pending, &mut visited)? {
                 match self
                     .network
-                    .set(node, &descriptor, subkey, &candidate)
+                    .set(&node, &descriptor, subkey, &candidate)
                     .await
                 {
                     Ok(SetOutcome::Accepted) => agreement += 1,
@@ -347,74 +402,15 @@ impl<N: Network, V: Verifier> Backend for NetworkBackend<N, V> {
     }
 
     async fn watch(&self, key: &RecordKey) -> Result<WatchId, Error> {
-        self.cached_descriptor(key)?;
-        // Refuse exhausted or interrupted local bookkeeping before allocating
-        // any remote lease. Opaque local IDs are never reused after failure.
-        let id = {
-            let _watches = self.watches.lock().map_err(|_| Error::Unavailable)?;
-            let mut next = self.next_watch.lock().map_err(|_| Error::Unavailable)?;
-            let id = WatchId(*next);
-            *next = next.checked_add(1).ok_or(Error::Unavailable)?;
-            id
-        };
-        for node in self.peers(key).await? {
-            if let Ok(remote) = self.network.watch(&node, key).await {
-                let stored = self
-                    .watches
-                    .lock()
-                    .map(|mut watches| {
-                        watches.insert(
-                            id,
-                            RemoteWatch {
-                                node,
-                                remote,
-                                key: *key,
-                            },
-                        );
-                    })
-                    .is_ok();
-                if !stored {
-                    // An interruption while the request was pending must not
-                    // deliberately abandon an accepted lease. Cancellation can
-                    // itself be uncertain; report failure and retain no authority.
-                    let _ = self.network.cancel_watch(&node, remote).await;
-                    return Err(Error::Unavailable);
-                }
-                return Ok(id);
-            }
-        }
-        Err(Error::Unavailable)
+        self.start_watch(key).await
     }
 
     async fn cancel_watch(&self, id: WatchId) -> Result<(), Error> {
-        let watch = self
-            .watches
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .remove(&id);
-        if let Some(watch) = watch {
-            self.network.cancel_watch(&watch.node, watch.remote).await?;
-        }
-        Ok(())
+        self.stop_watch(id).await
     }
 
     async fn changes(&self, id: WatchId) -> Result<Vec<Change>, Error> {
-        let (node, remote, key) = {
-            let watches = self.watches.lock().map_err(|_| Error::Unavailable)?;
-            let watch = watches.get(&id).ok_or(Error::UnknownWatch)?;
-            (watch.node, watch.remote, watch.key)
-        };
-        let descriptor = self.cached_descriptor(&key)?;
-        let schema = descriptor.validate_for(&key, &self.verifier)?;
-        let changes = self.network.changes(&node, remote).await?;
-        if changes.len() > schema.subkey_count()
-            || changes.iter().any(|c| {
-                c.key != key || c.subkey as usize >= schema.subkey_count() || c.seq > crate::MAX_SEQ
-            })
-        {
-            return Err(Error::Encoding);
-        }
-        Ok(changes)
+        self.watch_changes(id).await
     }
 }
 

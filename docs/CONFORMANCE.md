@@ -183,3 +183,39 @@ three signature entries (`crypto::MAX_CRYPTO_KINDS`) before iterating them. This
 is a bound only, not authentication or a new supported cryptosystem. A dedicated
 fixture alters the generated list's word/pointer counts so a valid known field
 coexists with an invalid unknown pointer; deep copying must still return Encoding.
+
+
+## Authenticated Tor watches (source candidate, not qualified)
+
+`watches::InboundWatches` ports the maintained inbound state with separate
+watcher and ENV0 node identities. Member classification uses the stored
+owner-signed descriptor: eight leases per member, 32 anonymous leases per record,
+with notification targets from authenticated original PeerInfo. It retains
+subkey sets, count, expiry, coalescing and same-origin write suppression.
+`LocalBackend::with_authenticated_watches` updates this state under the same
+record mutex as stored changes and removes it on record eviction. This source
+has not yet passed native, browser or upstream-oracle gates.
+
+The cancellation wrapper requires the original watcher identity, as creation and
+renewal do. The reviewed outer boundary
+`rpc_processor/rpc_watch_value.rs::process_watch_value_q` requires a signed
+operation, derives the watcher member ID, authenticates the response target, and
+passes these parameters into `StorageManager::inbound_watch_value`. The inner
+cancel path selects the record and existing watch ID. This is source evidence
+for this wrapper's stronger refusal of another signer using a leaked ID; it is
+not a demonstrated vulnerability in the complete upstream runtime. Identical
+rejected-input sets are not claimed. Manager review accepted this ordinary
+authorization wrapper on 2026-10-02 at 05:06.
+
+Valid same-watcher cancellation keeps unchanged WatchValueQ and WatchValueA
+encoding, including zero remaining duration and the existing ID. The mandatory
+oracle generates the cancel answer through the maintained coder. Actual signed
+ENV0 tests cover leaked-ID refusal, member/public limits, different-record
+refusal, renewal, coalescing, expiry and eviction. Written tests are not execution
+evidence. D4 is partly implemented: generic `NetworkBackend` still lacks
+upstream multi-node reconciliation and inspection fallback. The runtime must
+drive its actual timer and listener-loss path. D2 also remains: authenticated
+record-response peer hints now enter the same in-flight queue, but original
+concurrent lanes, node aging and complete routing-table reconciliation remain
+open. Progressive topology tests use actual independent stores and are unrun.
+No complete routing, watch equivalence or live-onion storage claim follows.

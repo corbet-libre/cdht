@@ -12,6 +12,43 @@ use simulation::SimNetwork;
 
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn record_responses_extend_the_same_fanout_without_counting_hints_as_holders() {
+    block_on(async {
+        let network = SimNetwork::new(5, Capacity::NATIVE);
+        network.discover_progressively();
+        let owner = key(59);
+        let mut writer = Dht::new(
+            NetworkBackend::new(network.clone(), TestVerifier),
+            TestVerifier,
+        );
+        let key = writer
+            .create(&Schema::dflt(1).unwrap(), &owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.set(&key, 0, b"dynamic", &owner, None).await.unwrap(),
+            WriteOutcome::Written { seq: 0 }
+        );
+        assert!((0..5).all(|index| network.store(index).usage().0 == 1));
+        network.discover_progressively();
+        let reader = NetworkBackend::new(network.clone(), TestVerifier);
+        assert!(reader.descriptor(&key).await.unwrap().is_some());
+        let report = reader.read(&key, 0).await.unwrap();
+        assert!(report.has_consensus());
+        assert_eq!((report.agreement, report.contacted), (3, 3));
+        assert_eq!(report.value.unwrap().data, b"dynamic");
+        // Discovery alone does not supply the missing fifth stored copy.
+        network.online(4, false);
+        network.discover_progressively();
+        assert_eq!(
+            writer.set(&key, 0, b"pending", &owner, None).await.unwrap(),
+            WriteOutcome::Queued { seq: 1 }
+        );
+    });
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn five_closest_copies_three_read_agreement_and_partial_evidence() {
     block_on(async {
         let network = SimNetwork::new(50, Capacity::NATIVE);

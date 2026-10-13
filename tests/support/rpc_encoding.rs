@@ -377,14 +377,17 @@ fn upstream_watch_vectors() {
             SignedOperation::sign(decode(&vector["question"]), &key(2).public_key(), &key(1))
                 .unwrap();
         let (id, request) = query(&operation).unwrap();
-        assert!(matches!(request, Query::Watch { .. }));
+        let Query::Watch { count, .. } = &request else {
+            panic!("original WatchValue question");
+        };
+        let granted_duration = if *count == 0 { 0 } else { 5_000_000 };
         assert_eq!(
             Question::encode(&request, id).unwrap().as_bytes(),
             operation.operation()
         );
         let response = Response::Watch {
             accepted: true,
-            duration_us: 5_000_000,
+            duration_us: granted_duration,
             watch_id: 7,
             peers: vec![],
         };

@@ -72,3 +72,36 @@ impl TestKey {
         .to_bytes()
     }
 }
+
+/// Actual maintained Veilid VLD0 node DH and stream cipher, used only with public
+/// fixture seeds. Production supplies the same primitive through scoped Keys.
+pub struct NodeCipher(pub u8);
+impl cdht::rpc::envelope::EnvelopeCipher for NodeCipher {
+    fn node_id(&self) -> PublicKey {
+        key(self.0).public_key()
+    }
+    fn crypt(
+        &self,
+        peer: &PublicKey,
+        nonce: &[u8; 24],
+        input: &[u8],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Error> {
+        use veilid_core_optimized as opt;
+        use zeroize::Zeroizing;
+        let public = opt::ed25519_public_to_x25519(peer).map_err(|_| Error::BadSignature)?;
+        let secret = Zeroizing::new(
+            opt::ed25519_secret_to_x25519(&[self.0; 32]).map_err(|_| Error::Signer)?,
+        );
+        let dh = Zeroizing::new(
+            opt::x25519_diffie_hellman(&secret[..], &public).map_err(|_| Error::BadSignature)?,
+        );
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"VLD0_CRYPT");
+        hasher.update(&dh[..]);
+        let shared = Zeroizing::new(*hasher.finalize().as_bytes());
+        let mut out = Zeroizing::new(input.to_vec());
+        opt::xchacha20_apply_keystream(&shared[..], nonce, &mut out)
+            .map_err(|_| Error::Encoding)?;
+        Ok(out)
+    }
+}

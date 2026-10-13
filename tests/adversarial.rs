@@ -110,7 +110,8 @@ fn forged_flush_reply_keeps_the_queue_and_cache() {
 
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-fn resume_coalesces_old_signed_queue_entries_to_the_newest_cached_value() {
+fn resume_preserves_original_pending_bytes_beside_a_newer_authenticated_cache() {
+    use cdht::Signer;
     block_on(async {
         let backend = LocalBackend::new(TestVerifier);
         let owner = key(1);
@@ -130,9 +131,17 @@ fn resume_coalesces_old_signed_queue_entries_to_the_newest_cached_value() {
         state["queue"] = old_queue;
         let state: ClientState = serde_json::from_value(state).unwrap();
         let mut resumed = Dht::with_state(backend.clone(), TestVerifier, state);
-        assert_eq!(resumed.state().queue()[0].value.seq, 1);
+        assert_eq!(resumed.state().queue()[0].value.seq, 0);
+        assert_eq!(resumed.state().queue()[0].value.data, b"old");
         backend.set_online(true);
-        resumed.flush().await.unwrap();
+        let latest =
+            SignedValue::sign(&owner.public_key(), 0, 1, b"latest".to_vec(), &owner).unwrap();
+        backend.set(&record, 0, &latest).await.unwrap();
+        let report = resumed.flush().await.unwrap();
+        assert_eq!(report.written, 0);
+        assert_eq!(report.stale, vec![(record, 0)]);
+        assert_eq!(report.remaining, 0);
+        assert_eq!(resumed.get_signed(&record, 0).await.unwrap(), Some(latest));
         assert_eq!(
             backend.get(&record, 0).await.unwrap().unwrap().data,
             b"latest"

@@ -953,6 +953,7 @@ fn public_record_errors_never_contain_record_data() {
         (Error::UnknownRecord, "unknown record"),
         (Error::NotOpen, "record not open"),
         (Error::UnknownWatch, "unknown watch"),
+        (Error::WatchRefused, "watch refused"),
         (Error::Unavailable, "backend unavailable"),
         (Error::Conflict, "concurrent write won"),
         (Error::Decrypt, "decryption failed"),

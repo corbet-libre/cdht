@@ -90,6 +90,7 @@ struct LocalState {
     online: bool,
     records: BTreeMap<RecordKey, StoredRecord>,
     watches: BTreeMap<WatchId, Watch>,
+    authenticated_watches: Option<crate::watches::InboundWatches>,
     next_watch: u64,
     capacity: Capacity,
     clock: u64,
@@ -164,6 +165,9 @@ impl LocalState {
                 .expect("admitted protected record fits capacity");
             self.records.remove(&oldest);
             self.watches.retain(|_, w| w.key != oldest);
+            if let Some(watches) = self.authenticated_watches.as_mut() {
+                watches.remove_record(&oldest);
+            }
             self.evictions += 1;
         }
     }
@@ -202,6 +206,7 @@ impl<V: Verifier> LocalBackend<V> {
                 online: true,
                 records: BTreeMap::new(),
                 watches: BTreeMap::new(),
+                authenticated_watches: None,
                 next_watch: 1,
                 capacity,
                 clock: 0,
@@ -283,25 +288,138 @@ impl<V: Verifier> LocalBackend<V> {
         Ok(())
     }
 
-    fn lock_any(&self) -> std::sync::MutexGuard<'_, LocalState> {
-        // A panic while holding the lock cannot leave the maps inconsistent: every
-        // mutation below is a single insert or push.
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Independent bounded storage with authenticated original protocol watches.
+    pub fn with_authenticated_watches(
+        verifier: V,
+        capacity: Capacity,
+        watches: crate::watches::WatchLimits,
+    ) -> Result<Self, Error> {
+        let watches = crate::watches::InboundWatches::new(watches)?;
+        let this = Self::with_capacity(verifier, capacity);
+        this.lock_any().authenticated_watches = Some(watches);
+        Ok(this)
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, LocalState>, Error> {
-        let state = self.lock_any();
-        if !state.online {
-            return Err(Error::Unavailable);
+    /// Store an original authenticated node SetValueQ. Both original descriptor
+    /// and writer signatures are checked before any descriptor or value is stored.
+    pub fn accept_value(
+        &self,
+        request: &crate::rpc::envelope::AuthenticatedOperation,
+    ) -> Result<SetOutcome, Error> {
+        let sender = request.sender_peer(self.verifier.as_ref())?;
+        if request.operation().signer() != sender.node_id() {
+            return Err(Error::BadSignature);
         }
-        Ok(state)
+        let (
+            _,
+            crate::rpc::Query::Set {
+                key,
+                subkey,
+                value,
+                descriptor,
+            },
+        ) = crate::rpc::query(request.operation())?
+        else {
+            return Err(Error::Encoding);
+        };
+        let descriptor = match descriptor {
+            Some(descriptor) => descriptor,
+            None => self
+                .lock()?
+                .records
+                .get(&key)
+                .map(|r| r.descriptor.clone())
+                .ok_or(Error::UnknownRecord)?,
+        };
+        let schema = descriptor.validate_for(&key, self.verifier.as_ref())?;
+        value.validate(
+            &key,
+            &descriptor.owner,
+            &schema,
+            subkey,
+            self.verifier.as_ref(),
+        )?;
+        self.create_record(&descriptor)?;
+        self.offer_value(&key, subkey, &value, Some(sender.node_id()))
     }
-}
 
-impl<V: Verifier> Backend for LocalBackend<V> {
-    async fn create(&self, descriptor: &Descriptor) -> Result<(), Error> {
+    /// Accept a wire watch using the retained authenticated stored descriptor.
+    /// A request cannot supply another schema to obtain a member watch allowance.
+    pub fn accept_watch(
+        &self,
+        request: &crate::rpc::envelope::AuthenticatedOperation,
+        now_us: u64,
+    ) -> Result<crate::watches::WatchLease, Error> {
+        let (_, crate::rpc::Query::Watch { key, .. }) = crate::rpc::query(request.operation())?
+        else {
+            return Err(Error::Encoding);
+        };
+        let mut state = self.lock()?;
+        let descriptor = state
+            .records
+            .get(&key)
+            .ok_or(Error::UnknownRecord)?
+            .descriptor
+            .clone();
+        state
+            .authenticated_watches
+            .as_mut()
+            .ok_or(Error::Unavailable)?
+            .apply(request, &descriptor, now_us, self.verifier.as_ref())
+    }
+
+    /// Take actual coalesced watch changes. Single-subkey hints retain the original
+    /// stored signed value; no sequence, nonce or writer signature is fabricated.
+    pub fn notifications(
+        &self,
+        now_us: u64,
+    ) -> Result<Vec<crate::watches::WatchNotification>, Error> {
+        let mut state = self.lock()?;
+        let mut notices = state
+            .authenticated_watches
+            .as_mut()
+            .ok_or(Error::Unavailable)?
+            .take_changes(now_us)?;
+        for notice in &mut notices {
+            if notice.hint.subkeys.len() == 1 {
+                notice.hint.value = notice
+                    .hint
+                    .subkeys
+                    .first()
+                    .and_then(|subkey| state.records.get(&notice.hint.key)?.values.get(&subkey))
+                    .cloned()
+                    .map(Box::new);
+            }
+        }
+        Ok(notices)
+    }
+
+    /// Read original sequence hints from one atomic local record snapshot. Empty
+    /// ranges mean all schema subkeys; requested ranges are clipped to the schema.
+    /// No missing subkey becomes a stored value: u32::MAX is upstream's sentinel.
+    pub fn inspect(
+        &self,
+        key: &RecordKey,
+        subkeys: &crate::rpc::SubkeyRanges,
+    ) -> Result<Option<(Descriptor, Vec<u32>)>, Error> {
+        let mut state = self.lock()?;
+        state.touch(key);
+        let Some(record) = state.records.get(key) else {
+            return Ok(None);
+        };
+        let seqs = (0..record.schema.subkey_count() as u32)
+            .filter(|subkey| subkeys.is_empty() || subkeys.contains(*subkey))
+            .map(|subkey| {
+                record
+                    .values
+                    .get(&subkey)
+                    .map_or(u32::MAX, |value| value.seq)
+            })
+            .collect();
+        Ok(Some((record.descriptor.clone(), seqs)))
+    }
+
+    fn create_record(&self, descriptor: &Descriptor) -> Result<(), Error> {
         let schema = descriptor.validate(self.verifier.as_ref())?;
         let key = descriptor.key();
         let mut state = self.lock()?;
@@ -332,31 +450,12 @@ impl<V: Verifier> Backend for LocalBackend<V> {
         state.enforce_capacity(&key);
         Ok(())
     }
-
-    async fn descriptor(&self, key: &RecordKey) -> Result<Option<Descriptor>, Error> {
-        let mut state = self.lock()?;
-        state.touch(key);
-        Ok(state
-            .records
-            .get(key)
-            .map(|record| record.descriptor.clone()))
-    }
-
-    async fn get(&self, key: &RecordKey, subkey: u32) -> Result<Option<SignedValue>, Error> {
-        let mut state = self.lock()?;
-        state.touch(key);
-        let record = state.records.get(key).ok_or(Error::UnknownRecord)?;
-        if subkey as usize >= record.schema.subkey_count() {
-            return Err(Error::SubkeyOutOfRange);
-        }
-        Ok(record.values.get(&subkey).cloned())
-    }
-
-    async fn set(
+    fn offer_value(
         &self,
         key: &RecordKey,
         subkey: u32,
         value: &SignedValue,
+        exclude: Option<&crate::NodeId>,
     ) -> Result<SetOutcome, Error> {
         let mut state = self.lock()?;
         let record = state.records.get(key).ok_or(Error::UnknownRecord)?;
@@ -403,7 +502,60 @@ impl<V: Verifier> Backend for LocalBackend<V> {
                 watch.changes.insert(subkey, change);
             }
         }
+        if let Some(watches) = state.authenticated_watches.as_mut() {
+            watches.changed(key, &crate::rpc::SubkeyRanges::from_iter([subkey]), exclude);
+        }
         Ok(SetOutcome::Accepted)
+    }
+
+    fn lock_any(&self) -> std::sync::MutexGuard<'_, LocalState> {
+        // A panic while holding the lock cannot leave the maps inconsistent: every
+        // mutation below is a single insert or push.
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, LocalState>, Error> {
+        let state = self.lock_any();
+        if !state.online {
+            return Err(Error::Unavailable);
+        }
+        Ok(state)
+    }
+}
+
+impl<V: Verifier> Backend for LocalBackend<V> {
+    async fn create(&self, descriptor: &Descriptor) -> Result<(), Error> {
+        self.create_record(descriptor)
+    }
+
+    async fn descriptor(&self, key: &RecordKey) -> Result<Option<Descriptor>, Error> {
+        let mut state = self.lock()?;
+        state.touch(key);
+        Ok(state
+            .records
+            .get(key)
+            .map(|record| record.descriptor.clone()))
+    }
+
+    async fn get(&self, key: &RecordKey, subkey: u32) -> Result<Option<SignedValue>, Error> {
+        let mut state = self.lock()?;
+        state.touch(key);
+        let record = state.records.get(key).ok_or(Error::UnknownRecord)?;
+        if subkey as usize >= record.schema.subkey_count() {
+            return Err(Error::SubkeyOutOfRange);
+        }
+        Ok(record.values.get(&subkey).cloned())
+    }
+
+    async fn set(
+        &self,
+        key: &RecordKey,
+        subkey: u32,
+        value: &SignedValue,
+    ) -> Result<SetOutcome, Error> {
+        self.offer_value(key, subkey, value, None)
     }
 
     async fn watch(&self, key: &RecordKey) -> Result<WatchId, Error> {

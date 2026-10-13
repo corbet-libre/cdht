@@ -4,17 +4,25 @@
 // License, v. 2.0. https://mozilla.org/MPL/2.0/
 // Upstream: veilid/veilid dd8e2cdd72b5bf817172ac31c20872b168c5c8fc,
 // rpc_processor/coders/{signed_value_data,signed_value_descriptor,operations/signed_operation}.rs.
-//! Bounded original Veilid record and signed-operation bytes. No network or keys.
+//! Bounded original Veilid record, application and signed-operation bytes. No network or keys.
 use crate::crypto::{PublicKey, Signature};
 use crate::{Descriptor, Error, SignedValue, Signer, Verifier, veilid_capnp as wire};
 use capnp::message::{Builder, HeapAllocator, Reader, ReaderOptions, ReaderSegments};
 use capnp::serialize::OwnedSegments;
 mod answer;
+mod application;
 mod changed;
+pub mod envelope;
+pub mod inspect;
+pub mod peers;
 mod watch;
 pub use answer::{Answer, Response, UnverifiedPeerInfoBytes};
+pub use application::{Application, OperationKind, application, operation_kind};
 pub use changed::{ChangeHint, Statement, value_changed};
 pub use watch::SubkeyRanges;
+#[cfg(test)]
+#[path = "../tests/unit/application.rs"]
+mod application_tests;
 const KIND: u32 = u32::from_be_bytes(*b"VLD0");
 /// Upstream ENV0 maximum uncompressed message size; transport framing is separate.
 pub const MAX_RPC_BYTES: usize = 65507;

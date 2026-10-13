@@ -14,7 +14,9 @@ Write all code comments and documentation in English.
 - No policy: which records exist and who may write them is decided by `cvlt`.
 - No application formats: epoch chains, per-device logs, clocks, tombstones and
   keep-both semantics belong inside record contents owned by domain libraries.
-- Never trust a backend or persisted state: validate descriptors and values on arrival.
+- Never trust data from the network; the in-process Veilid core is part of our trust
+  boundary. Tor backends require Records signature verification. Keep structural
+  key/schema/writer/sequence/size checks on every native value. Validate persisted state.
 - LGPL-3.0-only WITH LGPL-3.0-linking-exception. Do not add code available only under the
   full GPL or AGPL. Code copied from Veilid (MPL-2.0) goes into its own MPL-2.0 file with
   the upstream notice.
