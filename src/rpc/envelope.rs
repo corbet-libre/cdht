@@ -75,6 +75,15 @@ impl AuthenticatedOperation {
     ) -> Result<super::peers::VerifiedExtensionPeer, Error> {
         self.operation.sender_peer_as(&self.sender, verifier)
     }
+    /// As `sender_peer`; `None` when the question carries no sender PeerInfo (a dial-only
+    /// client). Such a sender is authenticated by the envelope but is no routing identity.
+    pub fn sender_peer_optional(
+        &self,
+        verifier: &impl Verifier,
+    ) -> Result<Option<super::peers::VerifiedExtensionPeer>, Error> {
+        self.operation
+            .sender_peer_optional_as(&self.sender, verifier)
+    }
 }
 impl Envelope {
     /// Seal the original packed SignedOperation body, with a fresh random nonce.

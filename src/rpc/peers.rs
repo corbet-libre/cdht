@@ -455,12 +455,29 @@ impl SignedOperation {
         sender: &PublicKey,
         verifier: &impl Verifier,
     ) -> Result<VerifiedExtensionPeer, Error> {
+        self.sender_peer_optional_as(sender, verifier)?
+            .ok_or(Error::Encoding)
+    }
+    /// As `sender_peer`, but a question that carries no sender PeerInfo (Veilid's optional
+    /// `sender_peer_info`, sent by a dial-only client that has no listener to advertise) is
+    /// `None` instead of an error. A present but invalid or replayed PeerInfo still fails.
+    pub fn sender_peer_optional(
+        &self,
+        verifier: &impl Verifier,
+    ) -> Result<Option<VerifiedExtensionPeer>, Error> {
+        self.sender_peer_optional_as(self.signer(), verifier)
+    }
+    pub(crate) fn sender_peer_optional_as(
+        &self,
+        sender: &PublicKey,
+        verifier: &impl Verifier,
+    ) -> Result<Option<VerifiedExtensionPeer>, Error> {
         let message = read(self.operation())?;
         let root = message
             .get_root::<wire::operation::Reader>()
             .map_err(|_| Error::Encoding)?;
         if !root.has_sender_peer_info() {
-            return Err(Error::Encoding);
+            return Ok(None);
         }
         let peer = root.get_sender_peer_info().map_err(|_| Error::Encoding)?;
         let mut standalone = Builder::new_default();
@@ -470,6 +487,6 @@ impl SignedOperation {
         if peer.node_id() != sender {
             return Err(Error::BadSignature);
         }
-        Ok(peer)
+        Ok(Some(peer))
     }
 }
