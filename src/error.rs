@@ -28,6 +28,12 @@ pub enum Error {
     UnknownWatch,
     /// An authenticated node answered but declined a watch lease.
     WatchRefused,
+    /// An authenticated caller asked for an operation this node does not serve it,
+    /// e.g. a dial-only (sender-less) caller asking for anything but a record lookup,
+    /// read or write.
+    Refused,
+    /// An authenticated caller exceeded the node's call budget for it.
+    RateLimited,
     /// The backend is unreachable (writes are queued).
     Unavailable,
     /// A concurrent write disagrees with the proposed value.
@@ -57,6 +63,8 @@ impl fmt::Display for Error {
             Error::NotOpen => "record not open",
             Error::UnknownWatch => "unknown watch",
             Error::WatchRefused => "watch refused",
+            Error::Refused => "operation refused for this caller",
+            Error::RateLimited => "call budget exceeded",
             Error::Unavailable => "backend unavailable",
             Error::Conflict => "concurrent write won",
             Error::Decrypt => "decryption failed",
