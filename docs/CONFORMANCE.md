@@ -94,7 +94,7 @@ Relevant upstream tests reviewed: `crypto/tests_crypto/test_crypto_sign.rs`,
 `storage_manager/tests_storage_manager/test_inbound_set_value_signature.rs`,
 and schema serialization tests under `veilid_api/tests_veilid_api`.
 
-## Deviations requiring manager review
+## Deviations requiring independent review
 
 No entry in this table is an approved change to the binding architecture. Format
 byte equality is tested; complete StorageManager/runtime equivalence is not claimed.
@@ -204,7 +204,7 @@ passes these parameters into `StorageManager::inbound_watch_value`. The inner
 cancel path selects the record and existing watch ID. This is source evidence
 for this wrapper's stronger refusal of another signer using a leaked ID; it is
 not a demonstrated vulnerability in the complete upstream runtime. Identical
-rejected-input sets are not claimed. Manager review accepted this ordinary
+rejected-input sets are not claimed. An independent review accepted this ordinary
 authorization wrapper on 2026-10-02 at 05:06.
 
 Valid same-watcher cancellation keeps unchanged WatchValueQ and WatchValueA
