@@ -35,4 +35,4 @@ Write all code comments and documentation in English.
 
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and
   `cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings` — all green in CI
-  (GitHub Actions). No local workstation builds.
+  (GitHub Actions). No local builds.
