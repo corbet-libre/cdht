@@ -1,38 +1,38 @@
-# Agent instructions
+# cdht — agent instructions
 
-Write all code comments and documentation in English.
+Work in a lane, never in ~/agents/scratch/ws. From the repo dir:
+`cargo fmt --all -- --check`,
+`cargo clippy --locked --all-targets -- -D warnings`,
+`cargo test --locked --no-fail-fast`,
+`cargo clippy --locked --lib --target wasm32-unknown-unknown -- -D warnings`,
+`CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo test
+--locked --target wasm32-unknown-unknown --lib --test records --test network
+--test adversarial --test rpc`.
+Conformance oracle: `ci/veilid-vectors.sh` (byte-identical Veilid, D1–D10).
+Coverage gate: `python3 .github/test-source-coverage.py &&
+python3 .github/check-source-coverage.py coverage.lcov coverage.json coverage.txt`.
+First-party git deps on main, one locked revision
+(`python3 .github/check-first-party.py`).
 
-## Product boundary
+Invariants (rules: docs/CONTRACT.md):
+- Never trust the network: forged/malformed/replayed backend replies never ack
+  or discard signed queue/cache (tests/adversarial.rs).
+- Transport preserves original blobs, signatures, sequence and nonces; forward
+  unchanged, never re-sign, renumber or re-encrypt (tests/rpc.rs).
+- 5 closest copies, 3-copy read agreement + explicit partial evidence;
+  silence/offline is never absence or ack (tests/network.rs:52,139,187,725).
+- Bounded stores: LRU, no TTL/expiry, record + byte quotas (tests/network.rs:220,317).
+- Owner rehydration reuses existing signed values without re-signing (:106).
+- queue_original stages an already-signed pair unchanged; cached observations and
+  same-slot obligations fence generation; equal-sequence differences refuse
+  (tests/original_publication.rs).
+- No secret keys: sign/verify via Signer/Verifier, open via scoped RecordCipher;
+  get_signed before open_value (tests/records.rs:493,544).
+- Watch events are hints, not contents; leases explicit, loss observable
+  (tests/watches.rs).
+- No policy (cvlt decides records/writers), no application formats in contents,
+  no veilid-core dep, no record expiry.
 
-- Signed replicated records with Veilid DHT semantics (DFLT/SMPL schemas, record key
-  derivation and limits identical to Veilid), a client with offline queue, watch,
-  VLD0 encryption, the `Backend` / `Network` ports, independent
-  capacity-bounded node stores and closest-node replication.
-- No production secret keys: sign/verify through `Signer` / `Verifier` and encrypt/open through scoped `RecordCipher`; independent upstream read-capability codecs are not a Keys export path.
-- No network code: remote fillings come through `cmsh`'s DHT capability (no layer
-  skipping; never depend on `veilid-core` here).
-- No policy: which records exist and who may write them is decided by `cvlt`.
-- No application formats: epoch chains, per-device logs, clocks, tombstones and
-  keep-both semantics belong inside record contents owned by domain libraries.
-- Never trust data from the network; the in-process Veilid core is part of our trust
-  boundary. Tor backends require Records signature verification. Keep structural
-  key/schema/writer/sequence/size checks on every native value. Validate persisted state.
-- LGPL-3.0-only WITH LGPL-3.0-linking-exception. Do not add code available only under the
-  full GPL or AGPL. Code copied from Veilid (MPL-2.0) goes into its own MPL-2.0 file with
-  the upstream notice.
-
-## Layout
-
-- `src/schema.rs`, `src/record.rs`: schema, descriptor, record key, signed value.
-- `src/backend.rs`: `Backend` port, capacity-bounded `LocalBackend`.
-- `src/network.rs`: `Network` port, `NetworkBackend`, read agreement and write fanout.
-- `src/veilid_capnp.rs`: unchanged upstream generated record modules (MPL-2.0).
-- `src/client.rs`: `Dht`, queue, `ClientState`.
-- `src/crypto.rs`: ports and record encryption.
-- `tests/common`: actual maintained dalek VLD0 signing and verification for fixtures.
-
-## Quality boundary
-
-- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and
-  `cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings` — all green in CI
-  (GitHub Actions). No local builds.
+Pointers: docs/CONTRACT.md, docs/CONFORMANCE.md, docs/CHURN.md,
+docs/NETWORK-PORT.md, docs/COVERAGE.md, tests/records.rs, tests/network.rs,
+tests/adversarial.rs, tests/original_publication.rs, tests/exact_publication.rs.
