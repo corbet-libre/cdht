@@ -20,7 +20,7 @@ cargo clippy --locked --lib --target wasm32-unknown-unknown -- -D warnings
 cargo metadata --locked --format-version 1 > dependency-metadata.json
 version=$(jq -r '.packages[] | select(.name == "wasm-bindgen") | .version' dependency-metadata.json)
 archive="wasm-bindgen-${version}-x86_64-unknown-linux-musl.tar.gz"
-base="https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}"
+base="${WASM_BINDGEN_DOWNLOAD_BASE:-https://github.com/wasm-bindgen/wasm-bindgen/releases/download}/${version}"
 runner_tmp="${RUNNER_TEMP}/wasm-runner"
 mkdir -p "$runner_tmp"
 cd "$runner_tmp"
