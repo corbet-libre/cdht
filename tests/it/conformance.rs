@@ -1,7 +1,6 @@
 //! Byte equality against the real upstream generator (required in the oracle CI job).
-mod common;
+use crate::common::{TestVerifier, key};
 use cdht::{Descriptor, EncryptionKey, Schema, SignedValue, Signer};
-use common::{TestVerifier, key};
 use data_encoding::BASE64URL_NOPAD;
 use serde_json::Value;
 
@@ -52,7 +51,7 @@ fn upstream_vectors() {
     .unwrap();
     assert_eq!(envelope.sender(), &owner.public_key());
     assert_eq!(
-        &*envelope.open(&common::NodeCipher(2)).unwrap(),
+        &*envelope.open(&crate::common::NodeCipher(2)).unwrap(),
         &bytes(&vectors["rpcPacket"])
     );
     for vector in vectors["schemas"].as_array().unwrap() {

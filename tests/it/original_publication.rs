@@ -1,14 +1,13 @@
 //! Original signed values, validating LocalBackend and original ClientState.
 //! Persistence faults model lost transport outcomes, not accepted authority or
 //! distributed Veilid/Tor replication. No signing capability reaches staging.
-mod common;
 
+use crate::common::{TestVerifier, key};
 use cdht::{
     Backend, Change, ClientState, Descriptor, Dht, EncryptionKey, Error, LocalBackend,
     QueuedPublication, RecordCipher, RecordKey, Schema, SetOutcome, SignedValue, Signer, WatchId,
     rpc::{DescriptorBytes, ValueBytes},
 };
-use common::{TestVerifier, key};
 use futures::FutureExt;
 use futures_executor::block_on;
 use std::sync::{Arc, Mutex};

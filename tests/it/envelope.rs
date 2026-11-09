@@ -1,10 +1,9 @@
 //! Actual maintained VLD0 DH/cipher/signature round trips for original ENV0.
-mod common;
+use crate::common::{NodeCipher, TestVerifier, key};
 use cdht::{
     Signer,
     rpc::envelope::{Envelope, EnvelopeCipher, MAX_BODY_BYTES, TimeWindow},
 };
-use common::{NodeCipher, TestVerifier, key};
 
 fn window() -> TimeWindow {
     TimeWindow {

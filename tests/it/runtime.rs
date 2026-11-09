@@ -1,12 +1,11 @@
 //! A real signing/encrypting local engine qualifies the runtime facade itself.
 //! Native network and storage qualification belongs to Mesh/cvln's actual core.
-mod common;
+use crate::common::{TestKey, TestVerifier, key};
 use cdht::{
     Backend as RawBackend, Descriptor, Dht, EncryptionKey, Error, LocalBackend, RecordKey, Schema,
     SetOutcome, SignedValue, Signer,
     runtime::{Backend, Changes, Identity, Publication, Record, Value},
 };
-use common::{TestKey, TestVerifier, key};
 use futures_executor::block_on;
 
 struct Engine {

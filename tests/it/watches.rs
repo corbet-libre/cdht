@@ -1,5 +1,5 @@
 //! Original signed WatchValue/ENV0 authority with the ported bounded lease state.
-mod common;
+use crate::common::{NodeCipher, TestVerifier, key};
 use cdht::{
     Descriptor, Error, Member, RecordKey, Schema, Signer,
     rpc::{
@@ -9,7 +9,6 @@ use cdht::{
     },
     watches::{InboundWatches, WatchLease, WatchLimits},
 };
-use common::{NodeCipher, TestVerifier, key};
 use std::num::NonZeroUsize;
 
 fn request(

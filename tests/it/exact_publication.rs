@@ -1,12 +1,11 @@
 //! Exact semantic generations and fresh observations through original Records.
 //! LocalBackend acceptance proves this owner path, not distributed replication.
-mod common;
 
+use crate::common::{TestKey, TestVerifier, key};
 use cdht::{
     Backend, Change, ClientState, Descriptor, Dht, EncryptionKey, Error, LocalBackend, Member,
     QueuedPublication, RecordKey, Schema, SetOutcome, SignedValue, Signer, WatchId,
 };
-use common::{TestKey, TestVerifier, key};
 use futures_executor::block_on;
 use std::sync::{Arc, Mutex};
 

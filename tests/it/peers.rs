@@ -1,5 +1,5 @@
 //! Real VLD0 PeerInfo signatures and unchanged extension payloads.
-mod common;
+use crate::common::{TestKey, TestVerifier, key};
 use cdht::{
     Error, Signer,
     rpc::{
@@ -7,7 +7,6 @@ use cdht::{
         peers::{Advertisement, DHTV, DIRECT, ExtensionDialInfo},
     },
 };
-use common::{TestKey, TestVerifier, key};
 
 fn advertisement() -> Advertisement {
     Advertisement {
