@@ -6,7 +6,7 @@ cdht_root=$(pwd)
 cdht_revision=dd8e2cdd72b5bf817172ac31c20872b168c5c8fc
 cdht_upstream="${RUNNER_TEMP:?}/cdht-veilid"
 git -c http.userAgent=record-conformance init "$cdht_upstream"
-git -C "$cdht_upstream" -c http.userAgent=record-conformance fetch --depth=1 https://gitlab.com/veilid/veilid.git "$cdht_revision"
+git -C "$cdht_upstream" -c http.userAgent=record-conformance fetch --depth=1 "${VEILID_GIT_URL:-https://gitlab.com/veilid/veilid.git}" "$cdht_revision"
 git -C "$cdht_upstream" switch --detach FETCH_HEAD
 test "$(git -C "$cdht_upstream" rev-parse HEAD)" = "$cdht_revision"
 python3 - "$cdht_upstream" <<'PYCODE'
