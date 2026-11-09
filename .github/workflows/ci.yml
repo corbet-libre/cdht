@@ -140,8 +140,7 @@ jobs:
     - name: Execute actual Wasm records, queues, network and RPC vectors
       env:
         CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
-      run: cargo test --locked --target wasm32-unknown-unknown --lib --test records --test network --test adversarial
-        --test rpc
+      run: cargo test --locked --target wasm32-unknown-unknown --lib --test it
     needs:
     - resolve
   dependency-policy:

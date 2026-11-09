@@ -10,7 +10,7 @@
       "src/backend.rs": "c0910e9940c9ea7e684e79611d29f17c64f1680fa54594ecdc907873e07db812",
       "src/record.rs": "042db988f47002af92941e1436e7724f3f56700eff6ef382b94d27f019b44286",
       "src/rpc/answer.rs": "bc0087c812032b03270283d15675e12ee144c88a0b799a2c93063ba4f20b25e5",
-      "tests/records.rs": "af09e3ebc370945125ec788bdd0b255719572c83e633e9e4857480fe331f5679",
+      "tests/it/records.rs": "9e3cd07afe2c34cabe80bf8dac80fb13d61c385c3968d8e1048466fe409debd0",
       "tests/support/rpc_encoding.rs": "22c8bca282c60051635cf49bca08d12efacf2e161f5027fffebb900d0dd2f123",
       "Cargo.lock": "4a7c76419eba5c84f9e0de3337abb55cc4b4321ce7876138802b8ca9efc43872"
     }
@@ -26,7 +26,7 @@
       "src/backend.rs": "c0910e9940c9ea7e684e79611d29f17c64f1680fa54594ecdc907873e07db812",
       "src/record.rs": "042db988f47002af92941e1436e7724f3f56700eff6ef382b94d27f019b44286",
       "src/rpc/answer.rs": "bc0087c812032b03270283d15675e12ee144c88a0b799a2c93063ba4f20b25e5",
-      "tests/records.rs": "af09e3ebc370945125ec788bdd0b255719572c83e633e9e4857480fe331f5679",
+      "tests/it/records.rs": "9e3cd07afe2c34cabe80bf8dac80fb13d61c385c3968d8e1048466fe409debd0",
       "tests/support/rpc_encoding.rs": "22c8bca282c60051635cf49bca08d12efacf2e161f5027fffebb900d0dd2f123",
       "Cargo.lock": "4a7c76419eba5c84f9e0de3337abb55cc4b4321ce7876138802b8ca9efc43872"
     },
@@ -46,7 +46,7 @@
       "src/backend.rs": "c0910e9940c9ea7e684e79611d29f17c64f1680fa54594ecdc907873e07db812",
       "src/record.rs": "042db988f47002af92941e1436e7724f3f56700eff6ef382b94d27f019b44286",
       "src/rpc/answer.rs": "bc0087c812032b03270283d15675e12ee144c88a0b799a2c93063ba4f20b25e5",
-      "tests/records.rs": "af09e3ebc370945125ec788bdd0b255719572c83e633e9e4857480fe331f5679",
+      "tests/it/records.rs": "9e3cd07afe2c34cabe80bf8dac80fb13d61c385c3968d8e1048466fe409debd0",
       "tests/support/rpc_encoding.rs": "22c8bca282c60051635cf49bca08d12efacf2e161f5027fffebb900d0dd2f123",
       "Cargo.lock": "4a7c76419eba5c84f9e0de3337abb55cc4b4321ce7876138802b8ca9efc43872"
     },
@@ -66,7 +66,7 @@
       "src/backend.rs": "c0910e9940c9ea7e684e79611d29f17c64f1680fa54594ecdc907873e07db812",
       "src/record.rs": "042db988f47002af92941e1436e7724f3f56700eff6ef382b94d27f019b44286",
       "src/rpc/answer.rs": "bc0087c812032b03270283d15675e12ee144c88a0b799a2c93063ba4f20b25e5",
-      "tests/records.rs": "af09e3ebc370945125ec788bdd0b255719572c83e633e9e4857480fe331f5679",
+      "tests/it/records.rs": "9e3cd07afe2c34cabe80bf8dac80fb13d61c385c3968d8e1048466fe409debd0",
       "tests/support/rpc_encoding.rs": "22c8bca282c60051635cf49bca08d12efacf2e161f5027fffebb900d0dd2f123",
       "Cargo.lock": "4a7c76419eba5c84f9e0de3337abb55cc4b4321ce7876138802b8ca9efc43872"
     }
@@ -82,7 +82,7 @@
       "src/backend.rs": "c0910e9940c9ea7e684e79611d29f17c64f1680fa54594ecdc907873e07db812",
       "src/record.rs": "042db988f47002af92941e1436e7724f3f56700eff6ef382b94d27f019b44286",
       "src/rpc/answer.rs": "bc0087c812032b03270283d15675e12ee144c88a0b799a2c93063ba4f20b25e5",
-      "tests/records.rs": "af09e3ebc370945125ec788bdd0b255719572c83e633e9e4857480fe331f5679",
+      "tests/it/records.rs": "9e3cd07afe2c34cabe80bf8dac80fb13d61c385c3968d8e1048466fe409debd0",
       "tests/support/rpc_encoding.rs": "22c8bca282c60051635cf49bca08d12efacf2e161f5027fffebb900d0dd2f123",
       "Cargo.lock": "4a7c76419eba5c84f9e0de3337abb55cc4b4321ce7876138802b8ca9efc43872"
     },
@@ -102,7 +102,7 @@
       "src/backend.rs": "c0910e9940c9ea7e684e79611d29f17c64f1680fa54594ecdc907873e07db812",
       "src/record.rs": "042db988f47002af92941e1436e7724f3f56700eff6ef382b94d27f019b44286",
       "src/rpc/answer.rs": "bc0087c812032b03270283d15675e12ee144c88a0b799a2c93063ba4f20b25e5",
-      "tests/records.rs": "af09e3ebc370945125ec788bdd0b255719572c83e633e9e4857480fe331f5679",
+      "tests/it/records.rs": "9e3cd07afe2c34cabe80bf8dac80fb13d61c385c3968d8e1048466fe409debd0",
       "tests/support/rpc_encoding.rs": "22c8bca282c60051635cf49bca08d12efacf2e161f5027fffebb900d0dd2f123",
       "Cargo.lock": "4a7c76419eba5c84f9e0de3337abb55cc4b4321ce7876138802b8ca9efc43872"
     },

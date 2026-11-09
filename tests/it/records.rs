@@ -1,12 +1,10 @@
 //! Schemas, descriptors, signed values and the client over the local filling.
 
-mod common;
-
+use crate::common::{TestKey, TestVerifier, key};
 use cdht::{
     Backend, ClientState, Descriptor, Dht, EncryptionKey, Error, LocalBackend, Member, RecordKey,
     Schema, SetOutcome, SignedValue, Signer, WriteOutcome,
 };
-use common::{TestKey, TestVerifier, key};
 use futures_executor::block_on;
 
 type Client = Dht<LocalBackend<TestVerifier>, TestVerifier>;

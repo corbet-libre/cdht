@@ -64,7 +64,7 @@ signature, ciphertext, raw blob and value signature, then validates received
 upstream blobs. Vectors and both Cargo lockfiles are retained as CI artifacts.
 The ordinary Rust job explicitly ignores this test; the oracle job must run it.
 
-`tests/network.rs`, `tests/records.rs`, `tests/adversarial.rs` and the existing
+`tests/it/network.rs`, `tests/it/records.rs`, `tests/it/adversarial.rs` and the existing
 record tests exercise independent node storage, 5/3 fanout, partial read evidence,
 owner restore into empty nodes, offline supersession, forged acknowledgments,
 sequence exhaustion, LRU/count/byte limits, no TTL and watch lease loss.

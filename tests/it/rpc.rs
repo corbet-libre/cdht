@@ -1,10 +1,9 @@
 //! Original signed record and upstream RPC bytes, native and actual Wasm.
-mod common;
+use crate::common::{TestVerifier, key};
 use cdht::rpc::{Answer, Response};
 use cdht::rpc::{DescriptorBytes, Query, Question, SignedOperation, ValueBytes, query};
 use cdht::{Backend, LocalBackend, SetOutcome};
 use cdht::{Descriptor, Error, Schema, SignedValue, Signer};
-use common::{TestVerifier, key};
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn opaque_bytes_preserve_nonce_signature_and_original_value_blob() {

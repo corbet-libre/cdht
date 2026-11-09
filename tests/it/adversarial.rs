@@ -1,10 +1,9 @@
 //! A backend acknowledgment is untrusted and must never discard pending work.
-mod common;
+use crate::common::{TestVerifier, key};
 use cdht::{
     Backend, Change, ClientState, Descriptor, Dht, Error, LocalBackend, RecordKey, Schema,
     SetOutcome, SignedValue, WatchId,
 };
-use common::{TestVerifier, key};
 use futures_executor::block_on;
 use std::sync::{Arc, Mutex};
 

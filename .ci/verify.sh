@@ -33,7 +33,7 @@ echo "$PWD" >> "$GITHUB_PATH"
 export PATH="$PWD:$PATH"
 cd "$OLDPWD"
 export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
-cargo test --locked --target wasm32-unknown-unknown --lib --test records --test network --test adversarial --test rpc
+cargo test --locked --target wasm32-unknown-unknown --lib --test it
 
 rustup run nightly rustc --version
 NIGHTLY_RUSTC="$(rustup which --toolchain nightly rustc)"

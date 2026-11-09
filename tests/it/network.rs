@@ -1,12 +1,11 @@
 //! Independent node stores exercise real fanout, signatures, capacity and churn.
-mod common;
-#[path = "common/network.rs"]
+#[path = "../common/network.rs"]
 mod simulation;
+use crate::common::{TestVerifier, key};
 use cdht::{
     Backend, Capacity, Dht, Error, LocalBackend, MAX_WATCH_MS, NetworkBackend, Schema, SignedValue,
     Signer, WriteOutcome,
 };
-use common::{TestVerifier, key};
 use futures_executor::block_on;
 use simulation::SimNetwork;
 
